@@ -1,6 +1,6 @@
 import type { CSSProperties } from "react";
 
-export function Icon({ name, size = 20, style }: { name: "plus" | "panel" | "arrow" | "chat" | "download" | "retry" | "menu" | "close" | "film"; size?: number; style?: CSSProperties }) {
+export function Icon({ name, size = 20, style }: { name: "plus" | "panel" | "arrow" | "chat" | "download" | "retry" | "menu" | "close" | "film" | "trash"; size?: number; style?: CSSProperties }) {
   const paths = {
     plus: <path d="M12 5v14M5 12h14" />,
     panel: <><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M9 4v16" /></>,
@@ -11,6 +11,7 @@ export function Icon({ name, size = 20, style }: { name: "plus" | "panel" | "arr
     menu: <path d="M4 6h16M4 12h16M4 18h16" />,
     close: <path d="m6 6 12 12M6 18 18 6" />,
     film: <><rect x="3" y="4" width="18" height="16" rx="3" /><path d="m10 8 6 4-6 4Z" /></>,
+    trash: <><path d="M4 7h16" /><path d="M10 11v6M14 11v6" /><path d="M6 7l1 14h10l1-14" /><path d="M9 7V4h6v3" /></>,
   };
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={style}>{paths[name]}</svg>;
 }

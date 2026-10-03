@@ -13,6 +13,7 @@ export function GenerationMessage({ turn, busy, onRegenerate }: { turn: Turn; bu
   const failed = turn.status === "FAILED";
   const outputUrl = job?.outputUrl;
   const aspectRatio = job?.aspectRatio || turn.settings.aspectRatio;
+  const progress = Math.max(0, Math.min(100, Math.round(job?.progress ?? 0)));
 
   async function download() {
     if (!outputUrl || downloading) return;
@@ -42,6 +43,12 @@ export function GenerationMessage({ turn, busy, onRegenerate }: { turn: Turn; bu
       {loading && <>
         <div className={`videoPlaceholder ratio-${aspectRatio.replace(":", "-")}`} aria-hidden="true"><div className="frameCorners" /><div className="placeholderCenter"><span className="renderMark">T</span><span>CREATING YOUR VIDEO</span><div className="renderDots"><i /><i /><i /></div></div></div>
         <div className="renderStatus"><span className="statusSpinner" /><span>{turn.connectionLost ? "Connection interrupted. Reconnecting…" : turn.status === "PLANNING" ? "Preparing scenes from your prompt" : turn.status === "STARTING" ? "Submitting your render" : turn.status === "QUEUED" ? "Waiting for the GPU" : turn.status === "STITCHING" ? "Joining your scenes" : turn.status === "UPLOADING" ? "Preparing the final video" : "LTX-2.5 is rendering your scene"}</span></div>
+        {job && <div className="generationProgress">
+          <div className="generationProgressInfo"><span>Video generation progress</span><strong>{progress}%</strong></div>
+          <div className="generationProgressTrack" role="progressbar" aria-label="Video generation progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
+            <div className="generationProgressFill" style={{ width: `${progress}%` }} />
+          </div>
+        </div>}
         <p className="responseNote">This can take a few minutes. You can explore your other chats.</p>
       </>}
       {failed && <div className="failureCard"><p>The video couldn’t be completed. Try again, or adjust your prompt below.</p><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Try again</button></div>}

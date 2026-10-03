@@ -104,6 +104,33 @@ export function useConversations() {
   const newChat = () => setActiveId(null);
   const openChat = (id: string) => setActiveId(id);
 
+  const deleteConversation = useCallback(async (chatId: string) => {
+    const chat = conversations.find((conversation) => conversation.id === chatId);
+    if (!chat) return false;
+
+    if (chat.turns.some((turn) => isActive(turn.status))) {
+      setNotice("Wait for the active generation to finish before deleting this conversation.");
+      return false;
+    }
+
+    const generationIds = [...new Set(chat.turns.map((turn) => turn.job?.id).filter((id): id is string => Boolean(id)))];
+
+    try {
+      for (const generationId of generationIds) {
+        const response = await fetch(`/api/generations/${encodeURIComponent(generationId)}`, { method: "DELETE" });
+        if (!response.ok && response.status !== 404) throw new Error("delete");
+      }
+
+      setConversations((current) => current.filter((conversation) => conversation.id !== chatId));
+      setActiveId((current) => current === chatId ? null : current);
+      setNotice("");
+      return true;
+    } catch {
+      setNotice("Couldn’t delete this conversation. Please try again.");
+      return false;
+    }
+  }, [conversations]);
+
   function submit(rawPrompt: string, original?: Turn): boolean {
     const prompt = rawPrompt.trim();
     if (!ready || prompt.length < 5 || prompt.length > 8000) return false;
@@ -151,5 +178,5 @@ export function useConversations() {
     return true;
   }
 
-  return { conversations, activeId, active: conversations.find((chat) => chat.id === activeId), ready, notice, retryHistory: () => setHistoryAttempt((value) => value + 1), newChat, openChat, submit };
+  return { conversations, activeId, active: conversations.find((chat) => chat.id === activeId), ready, notice, retryHistory: () => setHistoryAttempt((value) => value + 1), newChat, openChat, deleteConversation, submit };
 }

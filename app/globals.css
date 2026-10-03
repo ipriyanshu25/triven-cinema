@@ -36,6 +36,15 @@ button { transition: background .18s, color .18s, opacity .18s, transform .18s; 
 .historyRow svg { flex-shrink: 0; opacity: .75; }
 .historyRow:hover { background: #eaeaec; }
 .historyRow.selected { background: #e5e5e9; color: #27272c; }
+.historyEntry { position: relative; flex-shrink: 0; }
+.historyEntry .historyRow { padding-right: 42px; }
+.historyDelete { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); width: 29px; height: 29px; display: grid; place-items: center; border: 0; border-radius: 8px; background: transparent; color: #8d8e97; }
+.historyDelete:hover:not(:disabled) { background: #dedee3; color: #a94a4a; }
+.historyDelete:disabled { opacity: .28; cursor: not-allowed; }
+@media (hover: hover) and (pointer: fine) {
+  .historyDelete { opacity: 0; pointer-events: none; }
+  .historyEntry:hover .historyDelete, .historyDelete:focus-visible { opacity: 1; pointer-events: auto; }
+}
 .historyPrompt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .historyActivity { width: 5px; height: 5px; border-radius: 50%; background: #80828e; margin-left: auto; flex-shrink: 0; animation: breathe 2s ease infinite; }
 .historyEmpty { color: #80818a; font-size: 12px; line-height: 1.8; margin: 0 12px; }
@@ -51,6 +60,8 @@ button { transition: background .18s, color .18s, opacity .18s, transform .18s; 
 .sidebarCollapsed .newChatButton { padding: 0; justify-content: center; }
 .sidebarCollapsed .historySection { padding: 12px 10px; }
 .sidebarCollapsed .historyRow { justify-content: center; padding: 12px 0; position: relative; }
+.sidebarCollapsed .historyEntry .historyRow { padding-right: 0; }
+.sidebarCollapsed .historyDelete { display: none; }
 .sidebarCollapsed .historyActivity { position: absolute; right: 5px; top: 7px; }
 .sidebarCollapsed .sidebarFooter { margin: 12px; padding: 18px 0 9px; justify-content: center; }
 .studioMain { grid-column: 2; display: flex; flex-direction: column; height: 100dvh; min-height: 0; min-width: 0; }
@@ -86,6 +97,11 @@ button { transition: background .18s, color .18s, opacity .18s, transform .18s; 
 .renderDots i:nth-child(2) { animation-delay: .2s; }
 .renderDots i:nth-child(3) { animation-delay: .4s; }
 .renderStatus { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #62636c; margin-top: 17px; }
+.generationProgress { width: 100%; margin-top: 14px; }
+.generationProgressInfo { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; color: #777881; font-size: 11px; }
+.generationProgressInfo strong { color: #3f4048; font-size: 12px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.generationProgressTrack { width: 100%; height: 5px; overflow: hidden; border-radius: 999px; background: #e3e3e8; }
+.generationProgressFill { height: 100%; border-radius: inherit; background: #555762; transition: width .5s ease; }
 .statusSpinner { width: 12px; height: 12px; flex-shrink: 0; border: 1.5px solid #dddde3; border-top-color: #777986; border-radius: 50%; animation: spin 1.1s linear infinite; }
 .responseNote { color: #80818a; font-size: 11px; line-height: 1.7; margin: 9px 0 0; }
 .resultMeta { display: flex; align-items: center; gap: 9px; margin-top: 14px; color: #7b7c85; font-size: 11px; }
@@ -148,6 +164,8 @@ button { transition: background .18s, color .18s, opacity .18s, transform .18s; 
   .sidebarCollapsed .newChatButton { justify-content: flex-start; padding: 0 12px; }
   .sidebarCollapsed .historySection { padding: 24px 12px; }
   .sidebarCollapsed .historyRow { justify-content: flex-start; padding: 10px 12px; }
+  .sidebarCollapsed .historyEntry .historyRow { padding-right: 42px; }
+  .sidebarCollapsed .historyDelete { display: grid; }
   .sidebarCollapsed .historyActivity { position: static; }
   .sidebarCollapsed .sidebarFooter { margin: 12px 18px; padding: 17px 4px 9px; justify-content: flex-start; }
   .conversationColumn { padding: 23px 17px 10px; }

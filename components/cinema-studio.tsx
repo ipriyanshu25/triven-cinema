@@ -9,7 +9,7 @@ import { Sidebar } from "./cinema/sidebar";
 import { useConversations } from "./cinema/use-conversations";
 
 export default function CinemaStudio() {
-  const { conversations, activeId, active, ready, notice, retryHistory, newChat, openChat, submit } = useConversations();
+  const { conversations, activeId, active, ready, notice, retryHistory, newChat, openChat, deleteConversation, submit } = useConversations();
   const [collapsed, setCollapsed] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const conversationEnd = useRef<HTMLDivElement>(null);
@@ -34,7 +34,7 @@ export default function CinemaStudio() {
   function selectChat(id: string) { openChat(id); closeDrawer(); }
 
   return <div className={`studioShell ${collapsed ? "sidebarCollapsed" : ""}`}>
-    <Sidebar conversations={conversations} activeId={activeId} collapsed={collapsed} drawerOpen={drawerOpen} onCollapse={() => setCollapsed((value) => !value)} onClose={closeDrawer} onNew={startNew} onOpen={selectChat} />
+    <Sidebar conversations={conversations} activeId={activeId} collapsed={collapsed} drawerOpen={drawerOpen} onCollapse={() => setCollapsed((value) => !value)} onClose={closeDrawer} onNew={startNew} onOpen={selectChat} onDelete={deleteConversation} />
     <main className="studioMain" inert={drawerOpen}>
       <header className="topBar"><div className="topBarLeft"><button className="iconButton mobileMenu" onClick={() => setDrawerOpen(true)} aria-label="Open sidebar" aria-controls="chat-sidebar" aria-expanded={drawerOpen}><Icon name="menu" /></button><span className="topTitle">{active?.title || "Triven Cinema"}</span></div><div className="topBarRight"><span className="topStatus">{process.env.NEXT_PUBLIC_MOCK_MODE === "true" ? "Preview mode" : "Your imagination, in motion"}</span><button className="iconButton" onClick={startNew} aria-label="New chat" title="New chat"><Icon name="plus" /></button></div></header>
       {notice && <div className="historyNotice" role="status">{notice}<button onClick={retryHistory}>Retry</button></div>}

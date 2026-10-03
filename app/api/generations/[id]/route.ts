@@ -35,3 +35,14 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
 
   return NextResponse.json(generation);
 }
+
+export async function DELETE(_: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  try {
+    const result = await prisma.generation.deleteMany({ where: { id } });
+    return NextResponse.json({ success: true, deleted: result.count > 0 });
+  } catch (error) {
+    console.error("Delete generation failed", error);
+    return NextResponse.json({ error: "Could not delete generation" }, { status: 500 });
+  }
+}
