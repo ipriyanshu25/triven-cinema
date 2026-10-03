@@ -1,0 +1,61 @@
+--- a/components/cinema/generation-message.tsx
++++ b/components/cinema/generation-message.tsx
+@@ -73,15 +73,15 @@
+         <p className="responseNote">High resolution, Pro mode and high FPS can take significantly longer. You can explore your other chats.</p>
+       </>}
+       {cancelled && <div className="failureCard stoppedCard"><p>This render was stopped. Edit the prompt and generate a new version, or regenerate with the same settings.</p><div className="resultActions"><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Regenerate</button></div></div>}
+-      {failed && <div className="failureCard"><p>The video couldn't be completed. Try again, or adjust your prompt below.</p><div className="resultActions"><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Try again</button></div></div>}
++      {failed && <div className="failureCard"><p>The video couldn&apos;t be completed. Try again, or adjust your prompt below.</p><div className="resultActions"><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Try again</button></div></div>}
+       {!loading && !failed && outputUrl && <>
+         <div className={`videoFrame ratio-${aspectRatio.replace(":", "-")}`}><video key={outputUrl} src={outputUrl} controls playsInline preload="metadata" onError={() => setPlaybackError(true)} /></div>
+-        {playbackError && <p className="responseNote">The video couldn't load. <a href={outputUrl} target="_blank" rel="noopener noreferrer">Open video directly</a></p>}
++        {playbackError && <p className="responseNote">The video couldn&apos;t load. <a href={outputUrl} target="_blank" rel="noopener noreferrer">Open video directly</a></p>}
+         <div className="resultMeta">
+           {videoTypeLabel(videoType)}<span>-</span>{job.durationSeconds} sec<span>-</span>{job.aspectRatio}<span>-</span>{renderModeLabel(turn.settings.renderMode)}<span>-</span>{resolution}<span>-</span>{turn.settings.fps} FPS<span>-</span>{audioQualityLabel(turn.settings.audioQuality)}{job.model && <><span>-</span>{job.model.toUpperCase()}</>}
+         </div>
+         <div className="resultActions"><button className="textAction" onClick={download} disabled={downloading}><Icon name="download" size={16} />{downloading ? "Downloading..." : "Download"}</button><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Regenerate</button></div>
+-        {downloadError && <p className="responseNote" role="status">Direct download isn't available from this host. <a href={outputUrl} target="_blank" rel="noopener noreferrer">Open the video to save it</a>.</p>}
++        {downloadError && <p className="responseNote" role="status">Direct download isn&apos;t available from this host. <a href={outputUrl} target="_blank" rel="noopener noreferrer">Open the video to save it</a>.</p>}
+       </>}
+       {!loading && !failed && !cancelled && !outputUrl && <p className="responseNote">The render finished, but its video link is unavailable.</p>}
+     </div>
+--- a/components/cinema/prompt-composer.tsx
++++ b/components/cinema/prompt-composer.tsx
+@@ -75,22 +75,24 @@
+   useEffect(() => {
+     if (!editDraft) return;
+ 
+-    setPrompt(editDraft.prompt);
+-    setVideoType(editDraft.settings.videoType);
+-    setAspectRatio(editDraft.settings.aspectRatio);
+-    setRenderMode(editDraft.settings.renderMode);
+-    setResolution(editDraft.settings.resolution);
+-    setFps(editDraft.settings.fps);
+-    setDuration([5, 10, 15, 30, 60].includes(editDraft.settings.durationSeconds) ? editDraft.settings.durationSeconds as DurationSelection : "auto");
+-    setAudioQuality(editDraft.settings.audioQuality);
+-
+-    const focusTimer = window.setTimeout(() => {
+-      textarea.current?.focus();
+-      textarea.current?.setSelectionRange(editDraft.prompt.length, editDraft.prompt.length);
++    const applyTimer = window.setTimeout(() => {
++      setPrompt(editDraft.prompt);
++      setVideoType(editDraft.settings.videoType);
++      setAspectRatio(editDraft.settings.aspectRatio);
++      setRenderMode(editDraft.settings.renderMode);
++      setResolution(editDraft.settings.resolution);
++      setFps(editDraft.settings.fps);
++      setDuration([5, 10, 15, 30, 60].includes(editDraft.settings.durationSeconds) ? editDraft.settings.durationSeconds as DurationSelection : "auto");
++      setAudioQuality(editDraft.settings.audioQuality);
+       onEditDraftApplied?.();
++
++      window.requestAnimationFrame(() => {
++        textarea.current?.focus();
++        textarea.current?.setSelectionRange(editDraft.prompt.length, editDraft.prompt.length);
++      });
+     }, 0);
+ 
+-    return () => window.clearTimeout(focusTimer);
++    return () => window.clearTimeout(applyTimer);
+   }, [editDraft, onEditDraftApplied]);
+ 
+   function send() {

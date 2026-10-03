@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ScenePlanItem } from "@/lib/types";
-import { conversationTitle, inferPromptSettings, isActive, turnFromJob, type Conversation, type Generation, type Turn } from "./chat-model";
+import { conversationTitle, inferPromptSettings, isActive, normalizeQuality, turnFromJob, turnStatusFromJob, type Conversation, type Generation, type Turn } from "./chat-model";
 
 const STORAGE_KEY = "triven.conversations.v1";
 
@@ -13,7 +13,24 @@ function readConversations(): Conversation[] {
     // Validate browser storage before using it as UI state.
     return parsed.filter((item): item is Conversation => Boolean(item && typeof item.id === "string" && typeof item.title === "string" && typeof item.createdAt === "string" && Array.isArray(item.turns) && item.turns.every((turn: Turn) => turn && typeof turn.id === "string" && typeof turn.prompt === "string" && typeof turn.status === "string" && turn.settings && ["16:9", "9:16", "1:1"].includes(turn.settings.aspectRatio) && (!turn.job || typeof turn.job.id === "string")))).map((chat) => ({
       ...chat,
-      turns: chat.turns.map((turn) => !turn.job && isActive(turn.status) ? { ...turn, status: "FAILED" } : turn),
+      turns: chat.turns.map((turn) => {
+        const inferred = inferPromptSettings(turn.prompt);
+        const migrated: Turn = {
+          ...turn,
+          settings: {
+            ...inferred,
+            ...turn.settings,
+            quality: normalizeQuality(turn.settings.quality || turn.job?.quality || inferred.quality),
+            renderMode: turn.settings.renderMode || turn.job?.metadata?.renderMode || inferred.renderMode,
+            resolution: turn.settings.resolution || turn.job?.metadata?.resolution || inferred.resolution,
+            fps: turn.settings.fps || turn.job?.metadata?.fps || inferred.fps,
+            audioQuality: turn.settings.audioQuality || turn.job?.metadata?.audioQuality || inferred.audioQuality,
+            videoType: turn.settings.videoType || turn.job?.metadata?.videoType || inferred.videoType,
+            nativeAudio: turn.settings.nativeAudio ?? turn.job?.nativeAudio ?? inferred.nativeAudio,
+          },
+        };
+        return !migrated.job && isActive(migrated.status) ? { ...migrated, status: "FAILED" } : migrated;
+      }),
     }));
   } catch { return []; }
 }
@@ -25,7 +42,7 @@ export function useConversations() {
   const [notice, setNotice] = useState("");
   const [historyAttempt, setHistoryAttempt] = useState(0);
   const submitting = useRef(new Set<string>());
-  const controllers = useRef(new Set<AbortController>());
+  const controllers = useRef(new Map<string, AbortController>());
   const initialized = useRef(false);
 
   useEffect(() => {
@@ -45,7 +62,7 @@ export function useConversations() {
           return [
             ...chats.map((chat) => ({ ...chat, turns: chat.turns.map((turn) => {
               const job = turn.job && byId.get(turn.job.id);
-              return job ? { ...turn, job, status: job.status } : turn;
+              return job ? { ...turn, job, status: turnStatusFromJob(job) } : turn;
             }) })),
             ...jobs.filter((job) => !known.has(job.id)).map((job) => ({ id: `job:${job.id}`, title: conversationTitle(job.prompt), createdAt: job.createdAt, turns: [turnFromJob(job)] })),
           ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -78,7 +95,7 @@ export function useConversations() {
   }, []);
 
   // One polling loop, keyed by stable job IDs. Requests never depend on the open chat.
-  const pendingJobs = JSON.stringify(conversations.flatMap((chat) => chat.turns.filter((turn) => turn.job && isActive(turn.status)).map((turn) => ({ chatId: chat.id, turnId: turn.id, jobId: turn.job!.id }))));
+  const pendingJobs = JSON.stringify(conversations.flatMap((chat) => chat.turns.filter((turn) => turn.job && isActive(turn.status) && turn.status !== "STOPPING").map((turn) => ({ chatId: chat.id, turnId: turn.id, jobId: turn.job!.id }))));
   useEffect(() => {
     const jobs: { chatId: string; turnId: string; jobId: string }[] = JSON.parse(pendingJobs);
     if (!jobs.length) return;
@@ -90,7 +107,7 @@ export function useConversations() {
           const response = await fetch(`/api/generations/${encodeURIComponent(jobId)}`, { cache: "no-store", signal: controller.signal });
           if (!response.ok) throw new Error("status");
           const job: Generation = await response.json();
-          if (!controller.signal.aborted) updateTurn(chatId, turnId, { job, status: job.status, connectionLost: false });
+          if (!controller.signal.aborted) updateTurn(chatId, turnId, { job, status: turnStatusFromJob(job), connectionLost: false });
         } catch {
           if (!controller.signal.aborted) updateTurn(chatId, turnId, { connectionLost: true });
         }
@@ -131,13 +148,53 @@ export function useConversations() {
     }
   }, [conversations]);
 
-  function submit(rawPrompt: string, original?: Turn): boolean {
+  const stopGeneration = useCallback(async (chatId: string, turnId: string) => {
+    const chat = conversations.find((conversation) => conversation.id === chatId);
+    const turn = chat?.turns.find((item) => item.id === turnId);
+    if (!turn || !isActive(turn.status) || turn.status === "STOPPING") return false;
+
+    const controller = controllers.current.get(turnId);
+
+    // Scene planning happens locally in the browser request and can be stopped immediately.
+    if (!turn.job && turn.status === "PLANNING") {
+      controller?.abort();
+      controllers.current.delete(turnId);
+      submitting.current.delete(chatId);
+      updateTurn(chatId, turnId, { status: "CANCELLED", connectionLost: false });
+      setNotice("");
+      return true;
+    }
+
+    // Avoid aborting the POST while the server is creating the Modal call. Doing so can leave
+    // an orphan GPU job. The window is normally only a few seconds.
+    if (!turn.job) {
+      setNotice("The GPU job is starting. Stop will be available as soon as it is queued.");
+      return false;
+    }
+
+    updateTurn(chatId, turnId, { status: "STOPPING", connectionLost: false });
+
+    try {
+      const response = await fetch(`/api/generations/${encodeURIComponent(turn.job.id)}/cancel`, { method: "POST" });
+      const job: Generation = await response.json();
+      if (!response.ok) throw new Error("cancel");
+      updateTurn(chatId, turnId, { job, status: "CANCELLED", connectionLost: false });
+      setNotice("");
+      return true;
+    } catch {
+      updateTurn(chatId, turnId, { status: turn.status });
+      setNotice("Couldn’t stop this generation. Please try again.");
+      return false;
+    }
+  }, [conversations, updateTurn]);
+
+  function submit(rawPrompt: string, original?: Turn, explicitSettings?: Turn["settings"]): boolean {
     const prompt = rawPrompt.trim();
     if (!ready || prompt.length < 5 || prompt.length > 8000) return false;
     const chatId = activeId || crypto.randomUUID();
     if (submitting.current.has(chatId) || conversations.find((chat) => chat.id === chatId)?.turns.some((turn) => isActive(turn.status))) return false;
     submitting.current.add(chatId);
-    const settings = original?.settings || inferPromptSettings(prompt);
+    const settings = original?.settings || explicitSettings || inferPromptSettings(prompt);
     const turn: Turn = { id: crypto.randomUUID(), prompt, settings, status: settings.mode === "SCENES" ? "PLANNING" : "STARTING" };
     setConversations((chats) => {
       if (chats.some((chat) => chat.id === chatId)) return chats.map((chat) => chat.id === chatId ? { ...chat, turns: [...chat.turns, turn] } : chat);
@@ -145,7 +202,7 @@ export function useConversations() {
     });
     setActiveId(chatId);
     const controller = new AbortController();
-    controllers.current.add(controller);
+    controllers.current.set(turn.id, controller);
 
     void (async () => {
       try {
@@ -162,7 +219,7 @@ export function useConversations() {
         updateTurn(chatId, turn.id, { status: "STARTING" });
         const response = await fetch("/api/generations", {
           method: "POST", headers: { "content-type": "application/json" }, signal: controller.signal,
-          body: JSON.stringify({ prompt, mode: settings.mode, aspectRatio: settings.aspectRatio, quality: settings.quality, durationSeconds: settings.durationSeconds, model: "ltx-2.5", nativeAudio: original?.job?.nativeAudio ?? true, enhancePrompt: original?.job?.enhancePrompt ?? false, seed: Math.floor(Math.random() * 2_147_483_647), continuityContext, scenes }),
+          body: JSON.stringify({ prompt, mode: settings.mode, videoType: settings.videoType, aspectRatio: settings.aspectRatio, quality: settings.quality, renderMode: settings.renderMode, resolution: settings.resolution, fps: settings.fps, audioQuality: settings.audioQuality, durationSeconds: settings.durationSeconds, model: "ltx-2.5", nativeAudio: original?.job?.nativeAudio ?? settings.nativeAudio, enhancePrompt: original?.job?.enhancePrompt ?? false, seed: Math.floor(Math.random() * 2_147_483_647), continuityContext, scenes }),
         });
         const job: Generation = await response.json();
         // The API can return a persisted failed job with HTTP 502; retain its ID.
@@ -172,11 +229,11 @@ export function useConversations() {
         if (!controller.signal.aborted) updateTurn(chatId, turn.id, { status: "FAILED" });
       } finally {
         submitting.current.delete(chatId);
-        controllers.current.delete(controller);
+        controllers.current.delete(turn.id);
       }
     })();
     return true;
   }
 
-  return { conversations, activeId, active: conversations.find((chat) => chat.id === activeId), ready, notice, retryHistory: () => setHistoryAttempt((value) => value + 1), newChat, openChat, deleteConversation, submit };
+  return { conversations, activeId, active: conversations.find((chat) => chat.id === activeId), ready, notice, retryHistory: () => setHistoryAttempt((value) => value + 1), newChat, openChat, deleteConversation, stopGeneration, submit };
 }

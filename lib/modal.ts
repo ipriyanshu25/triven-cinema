@@ -1,11 +1,15 @@
-import type { ModalJobState, ScenePlanItem } from "@/lib/types";
+import type { AudioQuality, FrameRate, ModalJobState, RenderMode, Resolution, ScenePlanItem, StoredQuality } from "@/lib/types";
 
 type SubmitInput = {
   jobId: string;
   prompt: string;
   mode: "DIRECT" | "SCENES";
   aspectRatio: "16:9" | "9:16" | "1:1";
-  quality: "preview" | "1080p";
+  quality: StoredQuality;
+  renderMode: RenderMode;
+  resolution: Resolution;
+  fps: FrameRate;
+  audioQuality: AudioQuality;
   durationSeconds: number;
   nativeAudio: boolean;
   seed: number;
@@ -38,5 +42,16 @@ export async function getModalJob(jobId: string): Promise<ModalJobState> {
     cache: "no-store",
   });
   if (!response.ok) throw new Error(`Modal status failed (${response.status}): ${await response.text()}`);
+  return response.json();
+}
+
+export async function cancelModalJob(jobId: string): Promise<ModalJobState> {
+  const { base, secret } = config();
+  const response = await fetch(`${base}/cancel/${encodeURIComponent(jobId)}`, {
+    method: "POST",
+    headers: { "x-triven-secret": secret },
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error(`Modal cancel failed (${response.status}): ${await response.text()}`);
   return response.json();
 }

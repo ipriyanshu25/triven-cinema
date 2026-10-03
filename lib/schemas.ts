@@ -13,12 +13,25 @@ export const planSchema = z.object({
   aspectRatio: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
 });
 
+const fpsSchema = z.union([
+  z.literal(24),
+  z.literal(25),
+  z.literal(30),
+  z.literal(48),
+  z.literal(50),
+]);
+
 export const generationSchema = z.object({
   prompt: z.string().min(5).max(8000),
   mode: z.enum(["DIRECT", "SCENES"]),
+  videoType: z.enum(["cartoon", "story", "cinematic", "product-ad", "explainer", "social"]).default("cinematic"),
   model: z.literal("ltx-2.5").default("ltx-2.5"),
   aspectRatio: z.enum(["16:9", "9:16", "1:1"]),
-  quality: z.enum(["preview", "1080p"]),
+  quality: z.enum(["draft", "standard", "high", "ultra", "preview", "1080p"]),
+  renderMode: z.enum(["fast", "pro"]).default("fast"),
+  resolution: z.enum(["720p", "1080p", "1440p", "4k"]).default("1080p"),
+  fps: fpsSchema.default(24),
+  audioQuality: z.enum(["off", "standard", "high"]).default("standard"),
   durationSeconds: z.number().int().min(2).max(60),
   nativeAudio: z.boolean(),
   enhancePrompt: z.boolean(),

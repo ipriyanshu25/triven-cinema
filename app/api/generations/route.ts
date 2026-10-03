@@ -18,6 +18,7 @@ export async function POST(request: Request) {
     const input = generationSchema.parse(await request.json());
     const enhancedPrompt = input.enhancePrompt ? await enhanceVideoPrompt(input.prompt, input.continuityContext) : input.prompt;
     const seed = input.seed ?? Math.floor(Math.random() * 2_147_483_647);
+    const nativeAudio = input.audioQuality !== "off" && input.nativeAudio;
 
     const generation = await prisma.generation.create({
       data: {
@@ -28,7 +29,7 @@ export async function POST(request: Request) {
         aspectRatio: input.aspectRatio,
         quality: input.quality,
         durationSeconds: input.durationSeconds,
-        nativeAudio: input.nativeAudio,
+        nativeAudio,
         enhancePrompt: input.enhancePrompt,
         seed,
         status: MOCK_MODE ? "COMPLETED" : "QUEUED",
@@ -38,7 +39,15 @@ export async function POST(request: Request) {
         gpuType: MOCK_MODE ? "MOCK" : "B200",
         gpuSeconds: MOCK_MODE ? 0 : null,
         actualCost: MOCK_MODE ? 0 : null,
-        metadata: { continuityContext: input.continuityContext || null, mockMode: MOCK_MODE },
+        metadata: {
+          continuityContext: input.continuityContext || null,
+          videoType: input.videoType,
+          renderMode: input.renderMode,
+          resolution: input.resolution,
+          fps: input.fps,
+          audioQuality: input.audioQuality,
+          mockMode: MOCK_MODE,
+        },
         scenes: input.mode === "SCENES" && input.scenes ? {
           create: input.scenes.map(scene => ({ order: scene.order, title: scene.title, prompt: scene.prompt, duration: scene.duration, seed })),
         } : undefined,
@@ -55,12 +64,16 @@ export async function POST(request: Request) {
         mode: input.mode,
         aspectRatio: input.aspectRatio,
         quality: input.quality,
+        renderMode: input.renderMode,
+        resolution: input.resolution,
+        fps: input.fps,
+        audioQuality: input.audioQuality,
         durationSeconds: input.durationSeconds,
-        nativeAudio: input.nativeAudio,
+        nativeAudio,
         seed,
         scenes: input.mode === "SCENES" ? input.scenes?.map((scene) => ({ ...scene, prompt: `${input.continuityContext ? `${input.continuityContext} ` : ""}${scene.prompt}` })) : undefined,
       });
-      const updated = await prisma.generation.update({ where: { id: generation.id }, data: { providerJobId: job.callId } , include: { scenes: { orderBy: { order: "asc" } } } });
+      const updated = await prisma.generation.update({ where: { id: generation.id }, data: { providerJobId: job.callId }, include: { scenes: { orderBy: { order: "asc" } } } });
       return NextResponse.json(updated, { status: 201 });
     } catch (error) {
       const failed = await prisma.generation.update({ where: { id: generation.id }, data: { status: "FAILED", progress: 0, error: error instanceof Error ? error.message : "GPU job submission failed", statusMessage: "Could not start GPU job" }, include: { scenes: true } });

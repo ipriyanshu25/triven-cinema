@@ -1,0 +1,582 @@
+diff --git a/app/api/generations/[id]/cancel/route.ts b/app/api/generations/[id]/cancel/route.ts
+new file mode 100644
+index 0000000..5b023a6
+--- /dev/null
++++ b/app/api/generations/[id]/cancel/route.ts
+@@ -0,0 +1,39 @@
++import { NextResponse } from "next/server";
++import { cancelModalJob } from "@/lib/modal";
++import { prisma } from "@/lib/prisma";
++
++const MOCK_MODE = process.env.MOCK_MODE === "true";
++const STOPPED_MESSAGE = "Generation stopped by user";
++
++export async function POST(_: Request, { params }: { params: Promise<{ id: string }> }) {
++  const { id } = await params;
++  const generation = await prisma.generation.findUnique({
++    where: { id },
++    include: { scenes: { orderBy: { order: "asc" } } },
++  });
++
++  if (!generation) return NextResponse.json({ error: "Generation not found" }, { status: 404 });
++
++  if (["COMPLETED", "FAILED"].includes(generation.status)) {
++    return NextResponse.json(generation);
++  }
++
++  try {
++    if (!MOCK_MODE) await cancelModalJob(id);
++
++    const stopped = await prisma.generation.update({
++      where: { id },
++      data: {
++        status: "FAILED",
++        statusMessage: STOPPED_MESSAGE,
++        error: null,
++      },
++      include: { scenes: { orderBy: { order: "asc" } } },
++    });
++
++    return NextResponse.json(stopped);
++  } catch (error) {
++    console.error("Cancel generation failed", error);
++    return NextResponse.json({ error: "Could not stop generation" }, { status: 502 });
++  }
++}
+diff --git a/app/globals.css b/app/globals.css
+index 1b586bb..46b1b35 100644
+--- a/app/globals.css
++++ b/app/globals.css
+@@ -621,3 +621,29 @@ button { transition: background .18s, color .18s, opacity .18s, transform .18s,
+     flex: 1 1 calc(50% - 3px);
+   }
+ }
++
++/* Step 1.3 - stop generation + edit prompt */
++.sendButton.stopGenerationButton {
++  background: #2a2023;
++  color: #ffd9de;
++  border: 1px solid #5e363d;
++  box-shadow: 0 4px 18px #0000003d;
++}
++
++.sendButton.stopGenerationButton:hover:not(:disabled) {
++  background: #3a272b;
++  color: #ffffff;
++  border-color: #80505a;
++}
++
++.sendButton.stopGenerationButton:active:not(:disabled) {
++  transform: scale(.95);
++}
++
++.stoppedCard {
++  border-left-color: #8a704b;
++}
++
++.stoppedCard p {
++  color: #c7b99f;
++}
+diff --git a/components/cinema-studio.tsx b/components/cinema-studio.tsx
+index 7803cca..1894294 100644
+--- a/components/cinema-studio.tsx
++++ b/components/cinema-studio.tsx
+@@ -4,14 +4,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
+ import { isActive } from "./cinema/chat-model";
+ import { GenerationMessage } from "./cinema/generation-message";
+ import { Icon } from "./cinema/icons";
+-import { PromptComposer } from "./cinema/prompt-composer";
++import { PromptComposer, type ComposerEditDraft } from "./cinema/prompt-composer";
+ import { Sidebar } from "./cinema/sidebar";
+ import { useConversations } from "./cinema/use-conversations";
+ 
+ export default function CinemaStudio() {
+-  const { conversations, activeId, active, ready, notice, retryHistory, newChat, openChat, deleteConversation, submit } = useConversations();
++  const { conversations, activeId, active, ready, notice, retryHistory, newChat, openChat, deleteConversation, stopGeneration, submit } = useConversations();
+   const [collapsed, setCollapsed] = useState(false);
+   const [drawerOpen, setDrawerOpen] = useState(false);
++  const [editDraft, setEditDraft] = useState<ComposerEditDraft | null>(null);
+   const conversationEnd = useRef<HTMLDivElement>(null);
+   const scrollArea = useRef<HTMLDivElement>(null);
+   const nearBottom = useRef(true);
+@@ -30,8 +31,16 @@ export default function CinemaStudio() {
+     if (nearBottom.current) conversationEnd.current?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth", block: "end" });
+   }, [statuses]);
+ 
+-  function startNew() { newChat(); closeDrawer(); }
+-  function selectChat(id: string) { openChat(id); closeDrawer(); }
++  function startNew() { setEditDraft(null); newChat(); closeDrawer(); }
++  function selectChat(id: string) { setEditDraft(null); openChat(id); closeDrawer(); }
++  function stopCurrentGeneration() {
++    if (!active) return;
++    const activeTurn = active.turns.find((turn) => isActive(turn.status));
++    if (activeTurn) void stopGeneration(active.id, activeTurn.id);
++  }
++  function editTurn(turn: NonNullable<typeof active>["turns"][number]) {
++    setEditDraft({ id: `${turn.id}:${Date.now()}`, prompt: turn.prompt, settings: turn.settings });
++  }
+ 
+   return <div className={`studioShell ${collapsed ? "sidebarCollapsed" : ""}`}>
+     <Sidebar conversations={conversations} activeId={activeId} collapsed={collapsed} drawerOpen={drawerOpen} onCollapse={() => setCollapsed((value) => !value)} onClose={closeDrawer} onNew={startNew} onOpen={selectChat} onDelete={deleteConversation} />
+@@ -41,11 +50,20 @@ export default function CinemaStudio() {
+       <div className={`workspaceBody ${chatMode ? "chatMode" : "emptyMode"}`}>
+         <div className="conversationScroll" ref={scrollArea} onScroll={() => { const element = scrollArea.current; if (element) nearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 140; }}>
+           {chatMode ? <div className="conversationColumn" aria-label="Conversation">
+-            {active?.turns.map((turn) => <section className="conversationTurn" key={turn.id} aria-label="Video request"><div className="userMessage"><span className="srOnly">You: </span>{turn.prompt}</div><GenerationMessage turn={turn} busy={busy} onRegenerate={() => submit(turn.prompt, turn)} /></section>)}
++            {active?.turns.map((turn) => <section className="conversationTurn" key={turn.id} aria-label="Video request"><div className="userMessage"><span className="srOnly">You: </span>{turn.prompt}</div><GenerationMessage turn={turn} busy={busy} onRegenerate={() => submit(turn.prompt, turn)} onEdit={() => editTurn(turn)} /></section>)}
+             <div ref={conversationEnd} />
+           </div> : <section className="welcomeState"><div className="welcomeEmblem" aria-hidden="true">T</div><div className="welcomeBadge">TRIVEN CINEMA</div><h1>What do you want<br className="mobileBreak" /> to create?</h1><p>Describe a scene, story, ad or idea.<br />Triven turns it into a finished video.</p></section>}
+         </div>
+-        <PromptComposer key={activeId || "new-chat"} chatMode={chatMode} busy={busy} ready={ready} onSubmit={(prompt, settings) => submit(prompt, undefined, settings)} />
++        <PromptComposer
++          key={activeId || "new-chat"}
++          chatMode={chatMode}
++          busy={busy}
++          ready={ready}
++          onSubmit={(prompt, settings) => submit(prompt, undefined, settings)}
++          onStop={stopCurrentGeneration}
++          editDraft={editDraft}
++          onEditDraftApplied={() => setEditDraft(null)}
++        />
+         {!chatMode && <div className="emptyFootnote"><span /> One prompt. Endless possibilities.</div>}
+       </div>
+     </main>
+diff --git a/components/cinema/chat-model.ts b/components/cinema/chat-model.ts
+index 606cdc9..f13d5cc 100644
+--- a/components/cinema/chat-model.ts
++++ b/components/cinema/chat-model.ts
+@@ -211,6 +211,8 @@ export function statusLabel(status?: string) {
+   switch (status) {
+     case "QUEUED": return "Preparing your render";
+     case "PLANNING": return "Breaking the story into scenes";
++    case "STOPPING": return "Stopping generation";
++    case "CANCELLED": return "Generation stopped";
+     case "GENERATING": return "Generating video with LTX-2.5";
+     case "STITCHING": return "Joining your scenes";
+     case "UPLOADING": return "Preparing the final video";
+@@ -229,6 +231,9 @@ export type Generation = Omit<PromptSettings, "videoType" | "quality" | "renderM
+   enhancePrompt?: boolean;
+   status: string;
+   progress?: number | null;
++  statusMessage?: string | null;
++  error?: string | null;
++  providerJobId?: string | null;
+   outputUrl?: string | null;
+   createdAt: string;
+   scenes?: ScenePlanItem[];
+@@ -265,7 +270,12 @@ export function conversationTitle(prompt: string) {
+ }
+ 
+ export function isActive(status: string) {
+-  return !["COMPLETED", "FAILED"].includes(status);
++  return !["COMPLETED", "FAILED", "CANCELLED"].includes(status);
++}
++
++export function turnStatusFromJob(job: Generation) {
++  if (job.status === "FAILED" && job.statusMessage === "Generation stopped by user") return "CANCELLED";
++  return job.status;
+ }
+ 
+ export function turnFromJob(job: Generation): Turn {
+@@ -286,5 +296,5 @@ export function turnFromJob(job: Generation): Turn {
+     nativeAudio: audioQuality !== "off" && job.nativeAudio,
+     videoType: job.videoType || job.metadata?.videoType || inferred.videoType,
+   };
+-  return { id: job.id, prompt: job.prompt, settings, status: job.status, job };
++  return { id: job.id, prompt: job.prompt, settings, status: turnStatusFromJob(job), job };
+ }
+diff --git a/components/cinema/generation-message.tsx b/components/cinema/generation-message.tsx
+index 8a8b69a..3746831 100644
+--- a/components/cinema/generation-message.tsx
++++ b/components/cinema/generation-message.tsx
+@@ -12,13 +12,14 @@ import {
+ } from "./chat-model";
+ import { Icon } from "./icons";
+ 
+-export function GenerationMessage({ turn, busy, onRegenerate }: { turn: Turn; busy: boolean; onRegenerate: () => void }) {
++export function GenerationMessage({ turn, busy, onRegenerate, onEdit }: { turn: Turn; busy: boolean; onRegenerate: () => void; onEdit: () => void }) {
+   const [downloading, setDownloading] = useState(false);
+   const [downloadError, setDownloadError] = useState(false);
+   const [playbackError, setPlaybackError] = useState(false);
+   const job = turn.job;
+   const loading = isActive(turn.status);
+-  const failed = turn.status === "FAILED";
++  const cancelled = turn.status === "CANCELLED" || (turn.status === "FAILED" && job?.statusMessage === "Generation stopped by user");
++  const failed = turn.status === "FAILED" && !cancelled;
+   const outputUrl = job?.outputUrl;
+   const aspectRatio = job?.aspectRatio || turn.settings.aspectRatio;
+   const progress = Math.max(0, Math.min(100, Math.round(job?.progress ?? 0)));
+@@ -49,7 +50,7 @@ export function GenerationMessage({ turn, busy, onRegenerate }: { turn: Turn; bu
+     <span className="brandMark assistantMark" aria-hidden="true">T</span>
+     <div className="assistantContent">
+       <div className="assistantName">Triven Cinema</div>
+-      <h2 aria-live="polite">{failed ? "We couldn't finish this render" : loading ? statusLabel(turn.status) : outputUrl ? "Your video is ready" : "Render completed"}</h2>
++      <h2 aria-live="polite">{cancelled ? "Generation stopped" : failed ? "We couldn't finish this render" : loading ? statusLabel(turn.status) : outputUrl ? "Your video is ready" : "Render completed"}</h2>
+       <div className="generationSpecs" aria-label="Generation settings">
+         <span>{videoTypeLabel(videoType)}</span>
+         <span>{turn.settings.mode === "SCENES" ? "Multi-scene" : "Single scene"}</span>
+@@ -71,17 +72,18 @@ export function GenerationMessage({ turn, busy, onRegenerate }: { turn: Turn; bu
+         </div>}
+         <p className="responseNote">High resolution, Pro mode and high FPS can take significantly longer. You can explore your other chats.</p>
+       </>}
+-      {failed && <div className="failureCard"><p>The video couldn't be completed. Try again, or adjust your prompt below.</p><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Try again</button></div>}
++      {cancelled && <div className="failureCard stoppedCard"><p>This render was stopped. Edit the prompt and generate a new version, or regenerate with the same settings.</p><div className="resultActions"><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Regenerate</button></div></div>}
++      {failed && <div className="failureCard"><p>The video couldn't be completed. Try again, or adjust your prompt below.</p><div className="resultActions"><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Try again</button></div></div>}
+       {!loading && !failed && outputUrl && <>
+         <div className={`videoFrame ratio-${aspectRatio.replace(":", "-")}`}><video key={outputUrl} src={outputUrl} controls playsInline preload="metadata" onError={() => setPlaybackError(true)} /></div>
+         {playbackError && <p className="responseNote">The video couldn't load. <a href={outputUrl} target="_blank" rel="noopener noreferrer">Open video directly</a></p>}
+         <div className="resultMeta">
+           {videoTypeLabel(videoType)}<span>-</span>{job.durationSeconds} sec<span>-</span>{job.aspectRatio}<span>-</span>{renderModeLabel(turn.settings.renderMode)}<span>-</span>{resolution}<span>-</span>{turn.settings.fps} FPS<span>-</span>{audioQualityLabel(turn.settings.audioQuality)}{job.model && <><span>-</span>{job.model.toUpperCase()}</>}
+         </div>
+-        <div className="resultActions"><button className="textAction" onClick={download} disabled={downloading}><Icon name="download" size={16} />{downloading ? "Downloading..." : "Download"}</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Regenerate</button></div>
++        <div className="resultActions"><button className="textAction" onClick={download} disabled={downloading}><Icon name="download" size={16} />{downloading ? "Downloading..." : "Download"}</button><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Regenerate</button></div>
+         {downloadError && <p className="responseNote" role="status">Direct download isn't available from this host. <a href={outputUrl} target="_blank" rel="noopener noreferrer">Open the video to save it</a>.</p>}
+       </>}
+-      {!loading && !failed && !outputUrl && <p className="responseNote">The render finished, but its video link is unavailable.</p>}
++      {!loading && !failed && !cancelled && !outputUrl && <p className="responseNote">The render finished, but its video link is unavailable.</p>}
+     </div>
+   </div>;
+ }
+diff --git a/components/cinema/icons.tsx b/components/cinema/icons.tsx
+index 5b0ba07..0c7a93d 100644
+--- a/components/cinema/icons.tsx
++++ b/components/cinema/icons.tsx
+@@ -1,6 +1,6 @@
+ import type { CSSProperties } from "react";
+ 
+-export function Icon({ name, size = 20, style }: { name: "plus" | "panel" | "arrow" | "chat" | "download" | "retry" | "menu" | "close" | "film" | "trash"; size?: number; style?: CSSProperties }) {
++export function Icon({ name, size = 20, style }: { name: "plus" | "panel" | "arrow" | "chat" | "download" | "retry" | "menu" | "close" | "film" | "trash" | "pause" | "edit"; size?: number; style?: CSSProperties }) {
+   const paths = {
+     plus: <path d="M12 5v14M5 12h14" />,
+     panel: <><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M9 4v16" /></>,
+@@ -12,6 +12,8 @@ export function Icon({ name, size = 20, style }: { name: "plus" | "panel" | "arr
+     close: <path d="m6 6 12 12M6 18 18 6" />,
+     film: <><rect x="3" y="4" width="18" height="16" rx="3" /><path d="m10 8 6 4-6 4Z" /></>,
+     trash: <><path d="M4 7h16" /><path d="M10 11v6M14 11v6" /><path d="M6 7l1 14h10l1-14" /><path d="M9 7V4h6v3" /></>,
++    pause: <><path d="M9 6v12" /><path d="M15 6v12" /></>,
++    edit: <><path d="M4 20h4l10.5-10.5a2.12 2.12 0 0 0-3-3L5 17v3Z" /><path d="m13.5 8.5 3 3" /></>,
+   };
+   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={style}>{paths[name]}</svg>;
+ }
+diff --git a/components/cinema/prompt-composer.tsx b/components/cinema/prompt-composer.tsx
+index 3a2383a..1c334d1 100644
+--- a/components/cinema/prompt-composer.tsx
++++ b/components/cinema/prompt-composer.tsx
+@@ -20,16 +20,28 @@ type FpsSelection = FrameRate | "auto";
+ type AudioSelection = AudioQuality | "auto";
+ type DurationSelection = 5 | 10 | 15 | 30 | 60 | "auto";
+ 
++export type ComposerEditDraft = {
++  id: string;
++  prompt: string;
++  settings: PromptSettings;
++};
++
+ export function PromptComposer({
+   chatMode,
+   busy,
+   ready,
+   onSubmit,
++  onStop,
++  editDraft,
++  onEditDraftApplied,
+ }: {
+   chatMode: boolean;
+   busy: boolean;
+   ready: boolean;
+   onSubmit: (prompt: string, settings: PromptSettings) => boolean;
++  onStop: () => void;
++  editDraft?: ComposerEditDraft | null;
++  onEditDraftApplied?: () => void;
+ }) {
+   const [prompt, setPrompt] = useState("");
+   const [videoType, setVideoType] = useState<VideoTypeSelection>("auto");
+@@ -60,6 +72,27 @@ export function PromptComposer({
+     element.style.height = `${Math.min(220, Math.max(chatMode ? 64 : 112, element.scrollHeight))}px`;
+   }, [prompt, chatMode]);
+ 
++  useEffect(() => {
++    if (!editDraft) return;
++
++    setPrompt(editDraft.prompt);
++    setVideoType(editDraft.settings.videoType);
++    setAspectRatio(editDraft.settings.aspectRatio);
++    setRenderMode(editDraft.settings.renderMode);
++    setResolution(editDraft.settings.resolution);
++    setFps(editDraft.settings.fps);
++    setDuration([5, 10, 15, 30, 60].includes(editDraft.settings.durationSeconds) ? editDraft.settings.durationSeconds as DurationSelection : "auto");
++    setAudioQuality(editDraft.settings.audioQuality);
++
++    const focusTimer = window.setTimeout(() => {
++      textarea.current?.focus();
++      textarea.current?.setSelectionRange(editDraft.prompt.length, editDraft.prompt.length);
++      onEditDraftApplied?.();
++    }, 0);
++
++    return () => window.clearTimeout(focusTimer);
++  }, [editDraft, onEditDraftApplied]);
++
+   function send() {
+     if (canSubmit && onSubmit(prompt, settings)) {
+       setPrompt("");
+@@ -193,12 +226,13 @@ export function PromptComposer({
+         <div className="composerSpacer" />
+         <div className="composerEngine" title="Video model"><Icon name="film" size={15} /><span>LTX-2.5 {renderModeLabel(settings.renderMode)}</span></div>
+         <button
+-          className="sendButton"
+-          type="submit"
+-          disabled={!canSubmit}
+-          aria-label="Generate video"
+-          title={busy ? "Wait for this render to finish" : "Generate video (Cmd / Ctrl + Enter)"}
+-        ><Icon name="arrow" /></button>
++          className={`sendButton ${busy ? "stopGenerationButton" : ""}`}
++          type={busy ? "button" : "submit"}
++          disabled={busy ? !ready : !canSubmit}
++          aria-label={busy ? "Stop generation" : "Generate video"}
++          title={busy ? "Stop generation" : "Generate video (Cmd / Ctrl + Enter)"}
++          onClick={busy ? onStop : undefined}
++        ><Icon name={busy ? "pause" : "arrow"} /></button>
+       </div>
+     </form>
+ 
+@@ -206,7 +240,7 @@ export function PromptComposer({
+       {!ready
+         ? "Loading your workspace..."
+         : busy
+-          ? "Your current video is rendering. Start another request when it finishes."
++          ? "Your video is rendering. Use the pause button to stop this render, then edit the prompt or generate again."
+           : prompt.length > 0 && prompt.trim().length < 5
+             ? "Add a little more detail - at least 5 characters."
+             : "Choose Fast or Pro, resolution, FPS and native audio. Auto can infer them from your prompt."}
+diff --git a/components/cinema/use-conversations.ts b/components/cinema/use-conversations.ts
+index d3ceef2..c53c35c 100644
+--- a/components/cinema/use-conversations.ts
++++ b/components/cinema/use-conversations.ts
+@@ -2,7 +2,7 @@
+ 
+ import { useCallback, useEffect, useRef, useState } from "react";
+ import type { ScenePlanItem } from "@/lib/types";
+-import { conversationTitle, inferPromptSettings, isActive, normalizeQuality, turnFromJob, type Conversation, type Generation, type Turn } from "./chat-model";
++import { conversationTitle, inferPromptSettings, isActive, normalizeQuality, turnFromJob, turnStatusFromJob, type Conversation, type Generation, type Turn } from "./chat-model";
+ 
+ const STORAGE_KEY = "triven.conversations.v1";
+ 
+@@ -42,7 +42,7 @@ export function useConversations() {
+   const [notice, setNotice] = useState("");
+   const [historyAttempt, setHistoryAttempt] = useState(0);
+   const submitting = useRef(new Set<string>());
+-  const controllers = useRef(new Set<AbortController>());
++  const controllers = useRef(new Map<string, AbortController>());
+   const initialized = useRef(false);
+ 
+   useEffect(() => {
+@@ -62,7 +62,7 @@ export function useConversations() {
+           return [
+             ...chats.map((chat) => ({ ...chat, turns: chat.turns.map((turn) => {
+               const job = turn.job && byId.get(turn.job.id);
+-              return job ? { ...turn, job, status: job.status } : turn;
++              return job ? { ...turn, job, status: turnStatusFromJob(job) } : turn;
+             }) })),
+             ...jobs.filter((job) => !known.has(job.id)).map((job) => ({ id: `job:${job.id}`, title: conversationTitle(job.prompt), createdAt: job.createdAt, turns: [turnFromJob(job)] })),
+           ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+@@ -95,7 +95,7 @@ export function useConversations() {
+   }, []);
+ 
+   // One polling loop, keyed by stable job IDs. Requests never depend on the open chat.
+-  const pendingJobs = JSON.stringify(conversations.flatMap((chat) => chat.turns.filter((turn) => turn.job && isActive(turn.status)).map((turn) => ({ chatId: chat.id, turnId: turn.id, jobId: turn.job!.id }))));
++  const pendingJobs = JSON.stringify(conversations.flatMap((chat) => chat.turns.filter((turn) => turn.job && isActive(turn.status) && turn.status !== "STOPPING").map((turn) => ({ chatId: chat.id, turnId: turn.id, jobId: turn.job!.id }))));
+   useEffect(() => {
+     const jobs: { chatId: string; turnId: string; jobId: string }[] = JSON.parse(pendingJobs);
+     if (!jobs.length) return;
+@@ -107,7 +107,7 @@ export function useConversations() {
+           const response = await fetch(`/api/generations/${encodeURIComponent(jobId)}`, { cache: "no-store", signal: controller.signal });
+           if (!response.ok) throw new Error("status");
+           const job: Generation = await response.json();
+-          if (!controller.signal.aborted) updateTurn(chatId, turnId, { job, status: job.status, connectionLost: false });
++          if (!controller.signal.aborted) updateTurn(chatId, turnId, { job, status: turnStatusFromJob(job), connectionLost: false });
+         } catch {
+           if (!controller.signal.aborted) updateTurn(chatId, turnId, { connectionLost: true });
+         }
+@@ -148,6 +148,46 @@ export function useConversations() {
+     }
+   }, [conversations]);
+ 
++  const stopGeneration = useCallback(async (chatId: string, turnId: string) => {
++    const chat = conversations.find((conversation) => conversation.id === chatId);
++    const turn = chat?.turns.find((item) => item.id === turnId);
++    if (!turn || !isActive(turn.status) || turn.status === "STOPPING") return false;
++
++    const controller = controllers.current.get(turnId);
++
++    // Scene planning happens locally in the browser request and can be stopped immediately.
++    if (!turn.job && turn.status === "PLANNING") {
++      controller?.abort();
++      controllers.current.delete(turnId);
++      submitting.current.delete(chatId);
++      updateTurn(chatId, turnId, { status: "CANCELLED", connectionLost: false });
++      setNotice("");
++      return true;
++    }
++
++    // Avoid aborting the POST while the server is creating the Modal call. Doing so can leave
++    // an orphan GPU job. The window is normally only a few seconds.
++    if (!turn.job) {
++      setNotice("The GPU job is starting. Stop will be available as soon as it is queued.");
++      return false;
++    }
++
++    updateTurn(chatId, turnId, { status: "STOPPING", connectionLost: false });
++
++    try {
++      const response = await fetch(`/api/generations/${encodeURIComponent(turn.job.id)}/cancel`, { method: "POST" });
++      const job: Generation = await response.json();
++      if (!response.ok) throw new Error("cancel");
++      updateTurn(chatId, turnId, { job, status: "CANCELLED", connectionLost: false });
++      setNotice("");
++      return true;
++    } catch {
++      updateTurn(chatId, turnId, { status: turn.status });
++      setNotice("Couldn’t stop this generation. Please try again.");
++      return false;
++    }
++  }, [conversations, updateTurn]);
++
+   function submit(rawPrompt: string, original?: Turn, explicitSettings?: Turn["settings"]): boolean {
+     const prompt = rawPrompt.trim();
+     if (!ready || prompt.length < 5 || prompt.length > 8000) return false;
+@@ -162,7 +202,7 @@ export function useConversations() {
+     });
+     setActiveId(chatId);
+     const controller = new AbortController();
+-    controllers.current.add(controller);
++    controllers.current.set(turn.id, controller);
+ 
+     void (async () => {
+       try {
+@@ -189,11 +229,11 @@ export function useConversations() {
+         if (!controller.signal.aborted) updateTurn(chatId, turn.id, { status: "FAILED" });
+       } finally {
+         submitting.current.delete(chatId);
+-        controllers.current.delete(controller);
++        controllers.current.delete(turn.id);
+       }
+     })();
+     return true;
+   }
+ 
+-  return { conversations, activeId, active: conversations.find((chat) => chat.id === activeId), ready, notice, retryHistory: () => setHistoryAttempt((value) => value + 1), newChat, openChat, deleteConversation, submit };
++  return { conversations, activeId, active: conversations.find((chat) => chat.id === activeId), ready, notice, retryHistory: () => setHistoryAttempt((value) => value + 1), newChat, openChat, deleteConversation, stopGeneration, submit };
+ }
+diff --git a/lib/modal.ts b/lib/modal.ts
+index d5d88f2..8aeaf5e 100644
+--- a/lib/modal.ts
++++ b/lib/modal.ts
+@@ -44,3 +44,14 @@ export async function getModalJob(jobId: string): Promise<ModalJobState> {
+   if (!response.ok) throw new Error(`Modal status failed (${response.status}): ${await response.text()}`);
+   return response.json();
+ }
++
++export async function cancelModalJob(jobId: string): Promise<ModalJobState> {
++  const { base, secret } = config();
++  const response = await fetch(`${base}/cancel/${encodeURIComponent(jobId)}`, {
++    method: "POST",
++    headers: { "x-triven-secret": secret },
++    cache: "no-store",
++  });
++  if (!response.ok) throw new Error(`Modal cancel failed (${response.status}): ${await response.text()}`);
++  return response.json();
++}
+diff --git a/modal/cinema.py b/modal/cinema.py
+index a395ef9..dc39afa 100644
+--- a/modal/cinema.py
++++ b/modal/cinema.py
+@@ -86,6 +86,10 @@ def _set_job(job_id: str, **values: Any) -> None:
+     jobs[job_id] = current
+ 
+ 
++def _job_cancelled(job_id: str) -> bool:
++    return bool(dict(jobs.get(job_id, {})).get("cancelled"))
++
++
+ def _normalize_render_mode(value: str) -> str:
+     return value if value in {"fast", "pro"} else "fast"
+ 
+@@ -463,6 +467,8 @@ class LTXWorker:
+                 scenes = request.get("scenes") or []
+                 total = max(1, len(scenes))
+                 for i, scene in enumerate(scenes):
++                    if _job_cancelled(job_id):
++                        raise RuntimeError("Generation stopped by user")
+                     scene_duration = int(scene.get("duration", 5))
+                     if scene_duration > clip_limit:
+                         raise ValueError(
+@@ -504,6 +510,9 @@ class LTXWorker:
+                     index=0,
+                 ))
+ 
++            if _job_cancelled(job_id):
++                raise RuntimeError("Generation stopped by user")
++
+             final_path = str(Path(temp_dir) / "final.mp4")
+             _set_job(job_id, status="STITCHING", progress=84, message="Composing final MP4")
+             if len(clips) == 1:
+@@ -528,6 +537,17 @@ class LTXWorker:
+             return result
+         except Exception as exc:
+             gpu_seconds = time.time() - started
++            if _job_cancelled(job_id):
++                _set_job(
++                    job_id,
++                    status="FAILED",
++                    message="Generation stopped by user",
++                    error=None,
++                    gpuSeconds=gpu_seconds,
++                    actualCost=gpu_seconds * B200_PRICE_PER_SECOND,
++                    cancelled=True,
++                )
++                return dict(jobs.get(job_id, {}))
+             _set_job(job_id, status="FAILED", progress=0, message="Render failed", error=str(exc), gpuSeconds=gpu_seconds, actualCost=gpu_seconds * B200_PRICE_PER_SECOND)
+             raise
+         finally:
+@@ -552,10 +572,40 @@ def api():
+         job_id = str(payload.get("jobId", "")).strip()
+         if not job_id:
+             raise HTTPException(status_code=400, detail="jobId is required")
+-        _set_job(job_id, status="QUEUED", progress=3, message="Queued for B200")
++        _set_job(job_id, status="QUEUED", progress=3, message="Queued for B200", cancelled=False)
+         call = LTXWorker().generate.spawn(payload)
++        _set_job(job_id, callId=call.object_id)
+         return {"jobId": job_id, "callId": call.object_id}
+ 
++    @service.post("/cancel/{job_id}")
++    def cancel(job_id: str, x_triven_secret: str | None = Header(default=None)):
++        _auth(x_triven_secret)
++        state = jobs.get(job_id)
++        if state is None:
++            raise HTTPException(status_code=404, detail="Job not found")
++
++        state = dict(state)
++        if state.get("status") in {"COMPLETED", "FAILED"}:
++            return state
++
++        call_id = state.get("callId")
++        if not call_id:
++            raise HTTPException(status_code=409, detail="GPU call is still starting")
++
++        try:
++            modal.FunctionCall.from_id(str(call_id)).cancel(terminate_containers=True)
++        except Exception as exc:
++            raise HTTPException(status_code=502, detail=f"Could not cancel GPU call: {exc}") from exc
++
++        _set_job(
++            job_id,
++            status="FAILED",
++            message="Generation stopped by user",
++            error=None,
++            cancelled=True,
++        )
++        return dict(jobs.get(job_id, {}))
++
+     @service.get("/status/{job_id}")
+     def status(job_id: str, request: Request, x_triven_secret: str | None = Header(default=None)):
+         _auth(x_triven_secret)
