@@ -1,0 +1,139 @@
+import type { ScenePlan, ScenePlanItem } from "@/lib/types";
+
+const MAX_SCENES = 12;
+const MAX_SCENE_SECONDS = 15;
+
+function normalizeWhitespace(value: string): string {
+  return value
+    .replace(/\\\s*\n/g, "\n")
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function extractSection(prompt: string, heading: string, nextHeadings: string[]): string {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const next = nextHeadings
+    .map((item) => item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  const pattern = new RegExp(
+    `(?:^|\\n)#{0,4}\\s*${escaped}\\s*\\n([\\s\\S]*?)(?=\\n#{0,4}\\s*(?:${next})\\s*\\n|\\n#{0,4}\\s*SCENE\\s+\\d+|$)`,
+    "i",
+  );
+  return normalizeWhitespace(prompt.match(pattern)?.[1] || "");
+}
+
+function continuityFromPrompt(prompt: string): string {
+  const visual = extractSection(prompt, "Visual Style", ["Main Character", "Setting", "Audio", "Camera & Animation", "Important Generation Rules"]);
+  const character = extractSection(prompt, "Main Character", ["Setting", "Audio", "Camera & Animation", "Important Generation Rules"]);
+  const setting = extractSection(prompt, "Setting", ["Audio", "Camera & Animation", "Important Generation Rules"]);
+  const rules = extractSection(prompt, "Important Generation Rules", ["Audio", "Camera & Animation"]);
+
+  const selectedRules = rules
+    .split("\n")
+    .filter((line) => /consistent|appearance|environment|flicker|distort|character|background|transition/i.test(line))
+    .join(" ");
+
+  const pieces = [visual, character, setting, selectedRules].filter(Boolean);
+  if (pieces.length) {
+    return normalizeWhitespace(
+      `CONTINUITY LOCK. Preserve these details exactly across every scene: ${pieces.join(" ")}`,
+    ).slice(0, 3900);
+  }
+
+  return "CONTINUITY LOCK. Keep recurring characters identical in face, body proportions, colors, clothing, accessories, voice, and art style. Keep recurring environments, lighting language, palette, and camera style consistent across connected scenes.";
+}
+
+function parseTimedScenes(prompt: string): ScenePlanItem[] {
+  const normalized = prompt.replace(/\r/g, "");
+  const sceneHeader = /(?:^|\n)#{0,4}\s*SCENE\s+(\d+)\s*[—–-]\s*(\d+)\s*[—–-]\s*(\d+)\s*seconds?\s*\n/gi;
+  const matches = [...normalized.matchAll(sceneHeader)];
+
+  if (!matches.length) return [];
+
+  const scenes: ScenePlanItem[] = [];
+  for (let i = 0; i < Math.min(matches.length, MAX_SCENES); i += 1) {
+    const match = matches[i];
+    const order = Number(match[1]);
+    const start = Number(match[2]);
+    const end = Number(match[3]);
+    const bodyStart = (match.index || 0) + match[0].length;
+    const bodyEnd = i + 1 < matches.length ? (matches[i + 1].index || normalized.length) : normalized.length;
+    const rawBody = normalized.slice(bodyStart, bodyEnd);
+    const body = normalizeWhitespace(rawBody.split(/\n#{0,4}\s*(?:Audio|Camera & Animation|Important Generation Rules)\s*\n/i)[0]);
+    const requestedDuration = Math.max(2, end - start);
+    const duration = Math.min(MAX_SCENE_SECONDS, requestedDuration);
+
+    scenes.push({
+      order: Number.isFinite(order) ? order : i + 1,
+      title: `Scene ${Number.isFinite(order) ? order : i + 1}`,
+      duration,
+      prompt: body.slice(0, 2450),
+    });
+  }
+
+  return scenes;
+}
+
+function deterministicPlan(prompt: string, durationSeconds: number): ScenePlan {
+  const explicitScenes = parseTimedScenes(prompt);
+  if (explicitScenes.length) {
+    return {
+      summary: "Parsed the timed scenes directly from the user prompt. No external planning API was used.",
+      continuityContext: continuityFromPrompt(prompt),
+      scenes: explicitScenes,
+    };
+  }
+
+  const sceneCount = Math.max(2, Math.min(MAX_SCENES, Math.ceil(durationSeconds / 8)));
+  const baseDuration = Math.max(2, Math.min(MAX_SCENE_SECONDS, Math.floor(durationSeconds / sceneCount)));
+  let remaining = durationSeconds;
+  const phases = [
+    "Establish the setting and introduce the main subject",
+    "Show the inciting action clearly",
+    "Develop the central action with visible cause and effect",
+    "Move closer to the key story beat",
+    "Escalate the action with a clear visual change",
+    "Show the result or transformation",
+    "Resolve the central action",
+    "Finish with a memorable cinematic closing shot",
+    "Add a reaction shot that reinforces the story",
+    "Show a final environmental or character beat",
+    "Resolve any remaining visual action",
+    "End cleanly on the hero moment",
+  ];
+
+  const scenes = Array.from({ length: sceneCount }, (_, i) => {
+    const slotsLeft = sceneCount - i;
+    const duration = i === sceneCount - 1
+      ? Math.max(2, Math.min(MAX_SCENE_SECONDS, remaining))
+      : Math.max(2, Math.min(MAX_SCENE_SECONDS, Math.round(remaining / slotsLeft) || baseDuration));
+    remaining -= duration;
+    return {
+      order: i + 1,
+      title: `Scene ${i + 1}`,
+      duration,
+      prompt: `${phases[i] || phases[phases.length - 1]}. Story context: ${prompt.slice(0, 1500)}. Use chronological action, physically coherent motion, clear camera direction, consistent character design, and synchronized ambient audio.`.slice(0, 2450),
+    };
+  });
+
+  return {
+    summary: prompt,
+    continuityContext: continuityFromPrompt(prompt),
+    scenes,
+  };
+}
+
+export async function planScenes(prompt: string, durationSeconds: number, _aspectRatio: string): Promise<ScenePlan> {
+  return deterministicPlan(prompt, durationSeconds);
+}
+
+export async function enhanceVideoPrompt(prompt: string, continuityContext?: string): Promise<string> {
+  const clean = normalizeWhitespace(prompt);
+  // Long structured prompts are already detailed. Do not rewrite or expand them.
+  if (clean.length > 700 || /SCENE\s+\d+/i.test(clean)) return clean;
+  return normalizeWhitespace(
+    `${continuityContext ? `${continuityContext} ` : ""}${clean} Cinematic chronological action, precise subject appearance, coherent physical motion, intentional camera framing and movement, soft controlled lighting, detailed environment, and synchronized ambient audio.`,
+  ).slice(0, 7900);
+}

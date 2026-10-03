@@ -1,0 +1,12 @@
+node_modules
+.next
+.env
+.env.local
+*.log
+.DS_Store
+prisma/dev.db
+__pycache__
+*.pyc
+modal/.venv
+output
+.venv/

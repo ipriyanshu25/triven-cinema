@@ -1,0 +1,72 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum GenerationStatus {
+  QUEUED
+  PLANNING
+  GENERATING
+  STITCHING
+  UPLOADING
+  COMPLETED
+  FAILED
+}
+
+enum GenerationMode {
+  DIRECT
+  SCENES
+}
+
+model Generation {
+  id              String           @id @default(cuid())
+  prompt          String           @db.Text
+  enhancedPrompt  String?          @db.Text
+  mode            GenerationMode
+  model           String           @default("ltx-2.5")
+  aspectRatio     String           @default("16:9")
+  quality         String           @default("preview")
+  durationSeconds Int              @default(5)
+  nativeAudio     Boolean          @default(true)
+  enhancePrompt   Boolean          @default(true)
+  seed            Int?
+  status          GenerationStatus @default(QUEUED)
+  progress        Int              @default(0)
+  statusMessage   String?
+  providerJobId   String?
+  outputUrl       String?
+  thumbnailUrl    String?
+  gpuType         String?
+  gpuSeconds      Float?
+  estimatedCost   Float?
+  actualCost      Float?
+  error           String?          @db.Text
+  metadata        Json?
+  scenes          Scene[]
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([createdAt])
+  @@index([status])
+}
+
+model Scene {
+  id           String           @id @default(cuid())
+  generationId String
+  generation   Generation       @relation(fields: [generationId], references: [id], onDelete: Cascade)
+  order        Int
+  title        String
+  prompt       String           @db.Text
+  duration     Int              @default(5)
+  seed         Int?
+  status       GenerationStatus @default(QUEUED)
+  videoUrl     String?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@unique([generationId, order])
+}
