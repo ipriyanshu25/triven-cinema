@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { AspectRatio, AudioQuality, ContinuityMode, FrameRate, RenderMode, Resolution, ScenePlan, StoryAccuracy, VideoType } from "@/lib/types";
+import type { AspectRatio, AudioQuality, ContinuityMode, FrameRate, RenderMode, Resolution, ScenePlan, VideoType } from "@/lib/types";
 import {
   audioQualityLabel,
   inferPromptSettings,
@@ -19,10 +19,9 @@ type RenderModeSelection = RenderMode | "auto";
 type ResolutionSelection = Resolution | "auto";
 type FpsSelection = FrameRate | "auto";
 type AudioSelection = AudioQuality | "auto";
-type DurationSelection = 5 | 10 | 15 | 30 | 45 | 60 | 90 | 120 | 180 | "auto";
+type DurationSelection = 5 | 10 | 15 | 30 | 60 | 90 | 120 | 180 | "auto";
 type BuildSelection = "auto" | "DIRECT" | "SCENES";
 type ContinuitySelection = ContinuityMode | "auto";
-type StoryAccuracySelection = StoryAccuracy | "auto";
 
 export type ComposerEditDraft = {
   id: string;
@@ -30,14 +29,13 @@ export type ComposerEditDraft = {
   settings: PromptSettings;
 };
 
-const CREATION_PRESETS: { id: string; label: string; detail: string; videoType: VideoType; aspect: AspectRatio; duration: DurationSelection; build: BuildSelection; continuity: ContinuitySelection; accuracy: StoryAccuracySelection }[] = [
-  { id: "reel", label: "Reel / Short", detail: "Hook → beats → payoff", videoType: "social", aspect: "9:16", duration: 30, build: "SCENES", continuity: "balanced", accuracy: "standard" },
-  { id: "story", label: "Story Film", detail: "AI Director → scene review", videoType: "story", aspect: "16:9", duration: 60, build: "SCENES", continuity: "strict", accuracy: "high" },
-  { id: "cartoon", label: "Cartoon", detail: "Character-safe scene memory", videoType: "cartoon", aspect: "16:9", duration: 60, build: "SCENES", continuity: "strict", accuracy: "high" },
-  { id: "devotional", label: "Devotional", detail: "Sacred story → strict continuity", videoType: "devotional", aspect: "16:9", duration: 45, build: "SCENES", continuity: "strict", accuracy: "high" },
-  { id: "cinematic", label: "Cinematic", detail: "Premium visual sequence", videoType: "cinematic", aspect: "16:9", duration: 15, build: "auto", continuity: "balanced", accuracy: "standard" },
-  { id: "product", label: "Product Ad", detail: "Problem → proof → CTA", videoType: "product-ad", aspect: "9:16", duration: 30, build: "SCENES", continuity: "balanced", accuracy: "standard" },
-  { id: "explainer", label: "Explainer", detail: "Clear step-by-step story", videoType: "explainer", aspect: "16:9", duration: 60, build: "SCENES", continuity: "balanced", accuracy: "standard" },
+const CREATION_PRESETS: { id: string; label: string; detail: string; videoType: VideoType; aspect: AspectRatio; duration: DurationSelection; build: BuildSelection; continuity: ContinuitySelection }[] = [
+  { id: "reel", label: "Reel / Short", detail: "Hook → beats → payoff", videoType: "social", aspect: "9:16", duration: 30, build: "SCENES", continuity: "balanced" },
+  { id: "story", label: "Story Film", detail: "Setup → conflict → ending", videoType: "story", aspect: "16:9", duration: 60, build: "SCENES", continuity: "strict" },
+  { id: "cartoon", label: "Cartoon", detail: "Character-safe scene memory", videoType: "cartoon", aspect: "16:9", duration: 60, build: "SCENES", continuity: "strict" },
+  { id: "cinematic", label: "Cinematic", detail: "Premium visual sequence", videoType: "cinematic", aspect: "16:9", duration: 15, build: "auto", continuity: "balanced" },
+  { id: "product", label: "Product Ad", detail: "Problem → proof → CTA", videoType: "product-ad", aspect: "9:16", duration: 30, build: "SCENES", continuity: "balanced" },
+  { id: "explainer", label: "Explainer", detail: "Clear step-by-step story", videoType: "explainer", aspect: "16:9", duration: 60, build: "SCENES", continuity: "balanced" },
 ];
 
 export function PromptComposer({
@@ -67,7 +65,6 @@ export function PromptComposer({
   const [audioQuality, setAudioQuality] = useState<AudioSelection>("auto");
   const [buildMode, setBuildMode] = useState<BuildSelection>("auto");
   const [continuityMode, setContinuityMode] = useState<ContinuitySelection>("auto");
-  const [storyAccuracy, setStoryAccuracy] = useState<StoryAccuracySelection>("auto");
   const [scenePlan, setScenePlan] = useState<ScenePlan | null>(null);
   const [planning, setPlanning] = useState(false);
   const [planError, setPlanError] = useState("");
@@ -83,7 +80,6 @@ export function PromptComposer({
     audioQuality,
     mode: buildMode,
     continuityMode,
-    storyAccuracy,
   });
   const canSubmit = ready && !busy && prompt.trim().length >= 5;
   const hasPrompt = prompt.trim().length >= 5;
@@ -104,11 +100,10 @@ export function PromptComposer({
       setRenderMode(editDraft.settings.renderMode);
       setResolution(editDraft.settings.resolution);
       setFps(editDraft.settings.fps);
-      setDuration([5, 10, 15, 30, 45, 60, 90, 120, 180].includes(editDraft.settings.durationSeconds) ? editDraft.settings.durationSeconds as DurationSelection : "auto");
+      setDuration([5, 10, 15, 30, 60, 90, 120, 180].includes(editDraft.settings.durationSeconds) ? editDraft.settings.durationSeconds as DurationSelection : "auto");
       setAudioQuality(editDraft.settings.audioQuality);
       setBuildMode(editDraft.settings.mode);
       setContinuityMode(editDraft.settings.continuityMode);
-      setStoryAccuracy(editDraft.settings.storyAccuracy);
       setScenePlan(null);
       onEditDraftApplied?.();
       window.requestAnimationFrame(() => {
@@ -132,7 +127,6 @@ export function PromptComposer({
     setDuration(preset.duration);
     setBuildMode(preset.build);
     setContinuityMode(preset.continuity);
-    setStoryAccuracy(preset.accuracy);
     invalidatePlan();
     textarea.current?.focus();
   }
@@ -151,7 +145,6 @@ export function PromptComposer({
           aspectRatio: settings.aspectRatio,
           videoType: settings.videoType,
           continuityMode: settings.continuityMode,
-          storyAccuracy: settings.storyAccuracy,
         }),
       });
       const payload = await response.json();
@@ -200,7 +193,6 @@ export function PromptComposer({
         <strong>{videoTypeLabel(settings.videoType)}</strong><span>-</span>
         <span>{settings.mode === "SCENES" ? `${scenePlan?.scenes.length || "Auto"} scenes` : "Single shot"}</span><span>-</span>
         <span>{settings.continuityMode === "strict" ? "Strict memory" : settings.continuityMode === "creative" ? "Creative continuity" : "Balanced memory"}</span><span>-</span>
-        <span>{settings.storyAccuracy === "high" ? "AI Director + semantic review" : "Standard accuracy"}</span><span>-</span>
         <span>{renderModeLabel(settings.renderMode)}</span><span>-</span>
         <span>{outputResolution(settings.aspectRatio, settings.resolution)}</span><span>-</span>
         <span>{settings.fps} FPS</span><span>-</span><span>{settings.durationSeconds}s</span><span>-</span><span>{audioQualityLabel(settings.audioQuality)}</span>
@@ -208,7 +200,7 @@ export function PromptComposer({
 
       <div className="composerControls" aria-label="Video generation settings">
         <label className="composerControl wideControl"><span>Video type</span><select value={videoType} onChange={(event) => { setVideoType(event.target.value as VideoTypeSelection); invalidatePlan(); }} aria-label="Video type">
-          <option value="auto">Auto</option><option value="cartoon">Cartoon / Animation</option><option value="story">Story</option><option value="devotional">Devotional Story</option><option value="cinematic">Cinematic</option><option value="product-ad">Product Ad</option><option value="explainer">Explainer</option><option value="social">Reel / Social</option>
+          <option value="auto">Auto</option><option value="cartoon">Cartoon / Animation</option><option value="story">Story</option><option value="cinematic">Cinematic</option><option value="product-ad">Product Ad</option><option value="explainer">Explainer</option><option value="social">Reel / Social</option>
         </select></label>
 
         <label className="composerControl"><span>Build</span><select value={buildMode} onChange={(event) => { setBuildMode(event.target.value as BuildSelection); invalidatePlan(); }} aria-label="Build mode">
@@ -219,16 +211,12 @@ export function PromptComposer({
           <option value="auto">Auto</option><option value="strict">Strict</option><option value="balanced">Balanced</option><option value="creative">Creative</option>
         </select></label>
 
-        <label className="composerControl"><span>Accuracy</span><select value={storyAccuracy} onChange={(event) => { setStoryAccuracy(event.target.value as StoryAccuracySelection); invalidatePlan(); }} aria-label="Story accuracy">
-          <option value="auto">Auto</option><option value="high">High - AI Director</option><option value="standard">Standard</option>
-        </select></label>
-
         <label className="composerControl compactControl"><span>Frame</span><select value={aspectRatio} onChange={(event) => { setAspectRatio(event.target.value as AspectSelection); invalidatePlan(); }} aria-label="Aspect ratio"><option value="auto">Auto</option><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option></select></label>
 
         <label className="composerControl"><span>Mode</span><select value={renderMode} onChange={(event) => setRenderMode(event.target.value as RenderModeSelection)} aria-label="LTX render mode"><option value="auto">Auto</option><option value="fast">Fast - Distilled</option><option value="pro">Pro - Full / SFT</option></select></label>
         <label className="composerControl"><span>Resolution</span><select value={resolution} onChange={(event) => setResolution(event.target.value as ResolutionSelection)} aria-label="Video resolution"><option value="auto">Auto</option><option value="720p">720p</option><option value="1080p">1080p</option><option value="1440p">1440p</option><option value="4k">4K</option></select></label>
         <label className="composerControl compactControl"><span>FPS</span><select value={fps} onChange={(event) => setFps(event.target.value === "auto" ? "auto" : Number(event.target.value) as FrameRate)} aria-label="Frames per second"><option value="auto">Auto</option><option value="24">24 FPS</option><option value="25">25 FPS</option><option value="30">30 FPS (experimental)</option><option value="48">48 FPS</option><option value="50">50 FPS</option></select></label>
-        <label className="composerControl compactControl"><span>Duration</span><select value={duration} onChange={(event) => { setDuration(event.target.value === "auto" ? "auto" : Number(event.target.value) as DurationSelection); invalidatePlan(); }} aria-label="Video duration"><option value="auto">Auto</option><option value="5">5 sec</option><option value="10">10 sec</option><option value="15">15 sec</option><option value="30">30 sec</option><option value="45">45 sec</option><option value="60">60 sec</option><option value="90">90 sec</option><option value="120">2 min</option><option value="180">3 min</option></select></label>
+        <label className="composerControl compactControl"><span>Duration</span><select value={duration} onChange={(event) => { setDuration(event.target.value === "auto" ? "auto" : Number(event.target.value) as DurationSelection); invalidatePlan(); }} aria-label="Video duration"><option value="auto">Auto</option><option value="5">5 sec</option><option value="10">10 sec</option><option value="15">15 sec</option><option value="30">30 sec</option><option value="60">60 sec</option><option value="90">90 sec</option><option value="120">2 min</option><option value="180">3 min</option></select></label>
         <label className="composerControl audioControl"><span>Audio</span><select value={audioQuality} onChange={(event) => setAudioQuality(event.target.value as AudioSelection)} aria-label="Audio quality"><option value="auto">Auto</option><option value="off">Off</option><option value="standard">Native</option><option value="high">Native HQ</option></select></label>
 
         {settings.mode === "SCENES" && <button className="planScenesButton" type="button" disabled={!hasPrompt || planning || busy} onClick={() => void planScenes()}>{planning ? "Planning..." : scenePlan ? "Re-plan scenes" : "Plan scenes"}</button>}
@@ -241,6 +229,6 @@ export function PromptComposer({
     {planError && <p className="scenePlanError" role="status">{planError}</p>}
     {scenePlan && settings.mode === "SCENES" && <SceneBuilder plan={scenePlan} onChange={setScenePlan} onClose={() => setScenePlan(null)} />}
 
-    <p className="composerHint">{!ready ? "Loading your workspace..." : busy ? "Your video is rendering. Use the pause button to stop this render, then edit the prompt or generate again." : prompt.length > 0 && prompt.trim().length < 5 ? "Add a little more detail - at least 5 characters." : settings.mode === "SCENES" ? "Scene mode compiles the full story into scenes, locks recurring characters/world details, bridges previous frames, and can semantically review scenes before accepting them." : "Choose a format or describe the shot. Triven can automatically switch longer stories into scene mode."}</p>
+    <p className="composerHint">{!ready ? "Loading your workspace..." : busy ? "Your video is rendering. Use the pause button to stop this render, then edit the prompt or generate again." : prompt.length > 0 && prompt.trim().length < 5 ? "Add a little more detail - at least 5 characters." : settings.mode === "SCENES" ? "Scene mode keeps a continuity memory for recurring characters and can bridge the previous rendered frame into the next scene." : "Choose a format or describe the shot. Triven can automatically switch longer stories into scene mode."}</p>
   </div>;
 }

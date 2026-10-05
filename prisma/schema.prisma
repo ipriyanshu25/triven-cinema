@@ -13,6 +13,9 @@ enum GenerationStatus {
   GENERATING
   STITCHING
   UPLOADING
+  ANALYZING
+  CANCEL_REQUESTED
+  CANCELLED
   COMPLETED
   FAILED
 }
@@ -22,8 +25,16 @@ enum GenerationMode {
   SCENES
 }
 
+enum VideoVersionStatus {
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
 model Generation {
   id              String           @id @default(cuid())
+  clientRequestId String?          @unique
   prompt          String           @db.Text
   enhancedPrompt  String?          @db.Text
   mode            GenerationMode
@@ -46,7 +57,11 @@ model Generation {
   actualCost      Float?
   error           String?          @db.Text
   metadata        Json?
+  analysis        Json?
+  qcReport        Json?
   scenes          Scene[]
+  versions        VideoVersion[]
+  attempts        RenderAttempt[]
   createdAt       DateTime         @default(now())
   updatedAt       DateTime         @updatedAt
 
@@ -65,8 +80,41 @@ model Scene {
   seed         Int?
   status       GenerationStatus @default(QUEUED)
   videoUrl     String?
+  metadata     Json?
   createdAt    DateTime         @default(now())
   updatedAt    DateTime         @updatedAt
 
   @@unique([generationId, order])
+}
+
+model VideoVersion {
+  id           String             @id @default(cuid())
+  generationId String
+  generation   Generation         @relation(fields: [generationId], references: [id], onDelete: Cascade)
+  label        String             @default("Edited version")
+  status       VideoVersionStatus @default(QUEUED)
+  providerJobId String?
+  outputUrl    String?
+  thumbnailUrl String?
+  operations   Json
+  qcReport     Json?
+  error        String?            @db.Text
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  @@index([generationId, createdAt])
+  @@index([status])
+}
+
+model RenderAttempt {
+  id           String           @id @default(cuid())
+  generationId String
+  generation   Generation       @relation(fields: [generationId], references: [id], onDelete: Cascade)
+  providerJobId String?
+  status       GenerationStatus @default(QUEUED)
+  error        String?          @db.Text
+  startedAt    DateTime         @default(now())
+  finishedAt   DateTime?
+
+  @@index([generationId, startedAt])
 }

@@ -1,0 +1,25 @@
+--- a/components/cinema/video-editor.tsx
++++ b/components/cinema/video-editor.tsx
+@@ -56,9 +56,10 @@
+     } catch { /* keep current list */ }
+   }, [generationId]);
+ 
+-  useEffect(() => {
+-    if (open) void refreshVersions();
+-  }, [open, refreshVersions]);
++  function toggleEditor() {
++    if (!open) void refreshVersions();
++    setOpen((value) => !value);
++  }
+ 
+   useEffect(() => {
+     if (!processingId) return;
+@@ -118,7 +119,7 @@
+   const set = <K extends keyof VideoEditOperations,>(key: K, value: VideoEditOperations[K]) => setOperations((current) => ({ ...current, [key]: value }));
+ 
+   return <div className={`videoEditor ${open ? "open" : ""}`}>
+-    <button className="editorToggle" type="button" onClick={() => setOpen((value) => !value)}>
++    <button className="editorToggle" type="button" onClick={toggleEditor}>
+       <span>Video editor</span><small>Trim · speed · color · audio · crop · finishing</small>
+     </button>
+     {open && <div className="editorBody">

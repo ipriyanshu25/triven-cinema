@@ -59,7 +59,6 @@ export function GenerationMessage({ turn, busy, onRegenerate, onEdit }: { turn: 
       <div className="generationSpecs" aria-label="Generation settings">
         <span>{videoTypeLabel(videoType)}</span>
         <span>{turn.settings.mode === "SCENES" ? "Multi-scene" : "Single scene"}</span>
-        {turn.settings.mode === "SCENES" && <span>{turn.settings.continuityMode === "strict" ? "Strict memory" : turn.settings.continuityMode === "creative" ? "Creative continuity" : "Balanced memory"}</span>}
         <span>{turn.settings.durationSeconds}s</span>
         <span>{aspectRatio}</span>
         <span>{renderModeLabel(turn.settings.renderMode)} mode</span>
@@ -85,7 +84,7 @@ export function GenerationMessage({ turn, busy, onRegenerate, onEdit }: { turn: 
       {cancelled && <div className="failureCard stoppedCard"><p>This render was stopped. Edit the prompt and generate a new version, or regenerate with the same settings.</p><div className="resultActions"><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Regenerate</button></div></div>}
       {failed && <div className="failureCard"><p>The video couldn&apos;t be completed. {job?.error ? job.error : "Try again, or adjust your prompt below."}</p><div className="resultActions"><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Try again</button></div></div>}
 
-      {!loading && !failed && job && outputUrl && <>
+      {!loading && !failed && outputUrl && <>
         <div className={`videoFrame ratio-${aspectRatio.replace(":", "-")}`}><video key={previewUrl || outputUrl} src={previewUrl || outputUrl} poster={job?.thumbnailUrl || undefined} controls playsInline preload="metadata" onError={() => setPlaybackError(true)} /></div>
         {playbackError && <p className="responseNote">The video couldn&apos;t load. <a href={previewUrl || outputUrl} target="_blank" rel="noopener noreferrer">Open video directly</a></p>}
 

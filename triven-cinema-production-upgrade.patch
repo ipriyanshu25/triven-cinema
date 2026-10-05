@@ -1,0 +1,4450 @@
+diff --git a/.env.example b/.env.example
+index 91b91dc..aab54c0 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,14 +1,25 @@
+-# Local Postgres from docker-compose.yml
+-DATABASE_URL="postgresql://postgres:postgres@localhost:5432/triven_cinema?schema=public"
++# Local PostgreSQL from docker-compose.yml
++DATABASE_URL="postgresql://postgres:postgres@localhost:55432/triven_cinema?schema=public"
+ 
+-# Start with true. This completes jobs using the included demo video and costs $0.
++# $0 local UI test. Switch both to false for Modal.
+ MOCK_MODE="true"
+ NEXT_PUBLIC_MOCK_MODE="true"
+ 
+-# Scene planning is local/deterministic. No OpenAI or external LLM key is required.
++# Server-side safety rail. Requests above this many active generations return HTTP 429.
++TRIVEN_MAX_ACTIVE_GENERATIONS="2"
+ 
+-# Required only when MOCK_MODE=false.
++# Required when MOCK_MODE=false.
+ # Copy the URL printed by: modal deploy modal/cinema.py
+ MODAL_API_URL=""
+ # Must exactly match TRIVEN_WEB_SECRET in the Modal secret.
+ MODAL_WEB_SECRET="change-me-to-a-long-random-secret"
++
++# Production safety / capacity
++TRIVEN_MAX_ACTIVE_EDITS="4"
++TRIVEN_MAX_VERSIONS_PER_GENERATION="20"
++TRIVEN_ACTIVE_STALE_HOURS="6"
++
++# Optional HTTP Basic Auth for the whole demo/app. Leave blank locally.
++TRIVEN_BASIC_AUTH_USER=""
++TRIVEN_BASIC_AUTH_PASSWORD=""
++
+diff --git a/triven-patch-new/CHANGES-PRODUCTION.md b/CHANGES-PRODUCTION.md
+new file mode 100644
+index 0000000..cf1bb8f
+--- /dev/null
++++ b/CHANGES-PRODUCTION.md
+@@ -0,0 +1,59 @@
++# Triven Cinema — Production Upgrade Summary
++
++## Information gathered before changing the code
++
++- Reviewed the supplied Next.js/Prisma/Modal/LTX-2.5 project end to end.
++- Verified the cancellation path and preserved `terminate_containers=False`.
++- Inspected the existing LTX Fast/Pro, two-stage upscaling, scene loop, Modal Dict/Volume persistence, polling and editor UI.
++- Reproduced the old scene-planner weakness with an explicit zoo-style multi-scene prompt and verified the new parser isolates the lion scene instead of repeating the master prompt.
++- Probed the bundled demo MP4 and smoke-tested the FFmpeg edit stack with crop, color, sharpen, vignette, fades and loudness normalization.
++- Checked current LTX-2.5 and Modal documentation before choosing the capability boundaries documented in `PRODUCTION-PLAN.md`.
++
++## Section 1 — Production Intelligence + Generation
++
++Implemented:
++
++- structured production brief / AI Director
++- robust explicit scene parsing
++- continuity lock including main + supporting characters
++- scene-specific must-have rules
++- profile-aware scene splitting
++- idempotent browser submissions
++- render concurrency guard and stale-row safety window
++- render-attempt audit data
++- race-safe cancellation with `CANCEL_REQUESTED` / `CANCELLED`
++- warm B200 preservation and 120s scale-down window
++- B200 inference separated from CPU finalization
++- technical QC + thumbnails
++- signed Modal Volume media URLs
++- optional S3-compatible publishing
++- retained media cleanup on generation deletion
++- health endpoint and production security headers
++- optional Basic Auth gate for private/demo deployments
++
++## Section 2 — Post-Production + Editing
++
++Implemented as non-destructive CPU versions:
++
++- trim
++- speed + audio tempo correction
++- volume / mute / loudness normalization
++- fade in/out
++- brightness / contrast / saturation
++- sharpen / blur / vignette
++- crop / rotate / mirror
++- finishing presets
++- per-version QC + thumbnail
++- original/version preview
++- edited-version deletion + storage cleanup
++- editor concurrency and version limits
++
++## Validation completed in this environment
++
++- `python3 -m py_compile modal/cinema.py` — pass
++- TypeScript/TSX syntax transpile across application source — 0 syntax errors
++- explicit multi-scene planner smoke test — pass
++- continuity / exact-subject-count smoke test — pass
++- FFmpeg editor filter-chain smoke test — pass (H.264 + AAC output)
++
++A full `npm run lint` / `npm run build` could not be executed in this sandbox because npm registry downloads failed with DNS `EAI_AGAIN`. Run `npm run check` on the development Mac before deployment.
+diff --git a/triven-patch-new/PRODUCTION-PLAN.md b/PRODUCTION-PLAN.md
+new file mode 100644
+index 0000000..0c878e1
+--- /dev/null
++++ b/PRODUCTION-PLAN.md
+@@ -0,0 +1,101 @@
++# Triven Cinema — Production Upgrade Plan
++
++This build is intentionally split into **two systems** so expensive generation and flexible post-production do not fight each other.
++
++## Section 1 — Production Intelligence + Generation
++
++### A. Gather and understand the brief before GPU work
++
++Every request is converted into a `ProductionBrief` before inference. The director extracts or infers:
++
++- intent and video type
++- visual language
++- recurring characters
++- recurring locations/environments
++- camera language
++- audio direction
++- must-have and avoid rules
++- continuity lock
++- warnings for exact counts, exact dialogue, typography/logo fidelity and text-only identity consistency
++
++Common scene formats are parsed directly: `SCENE 1 — TITLE`, `TIME:`, `DURATION:`, `VISUAL:`, `ACTION:`, `CAMERA:`, `AUDIO:`, `DIALOGUE:`, `TRANSITION:` and `MUST HAVE:`.
++
++The previous failure mode where the beginning of one giant master prompt could be repeated into every scene is removed. Each scene now receives a scene-specific visual/action/audio prompt plus the continuity lock. Production labels, timestamps and camera notes are explicitly forbidden from becoming spoken dialogue.
++
++### B. Profile-aware shot planning
++
++Long videos are broken into renderable clips. Scene duration is automatically normalized to the selected profile so high-resolution/Pro/high-FPS work does not accidentally send an oversized single clip to the worker.
++
++The UI keeps 30 FPS only as an **experimental self-hosted** option. The production profiles are 24/25/48/50 FPS.
++
++### C. Job safety and spend control
++
++- client request IDs make generation submission idempotent from the browser
++- configurable active-render capacity limits uncontrolled B200 spend
++- stale active database rows stop counting against capacity after a configurable safety window
++- `RenderAttempt` rows preserve provider call IDs/status/errors for diagnosis
++- `CANCEL_REQUESTED` and `CANCELLED` are real states
++- immediate-stop race is handled even if the user cancels before a Modal call ID is written
++- cancellation uses `terminate_containers=False` so stopping one render does not intentionally kill the warm B200 container
++- B200 `scaledown_window` is extended to 120 seconds for faster consecutive renders while `max_containers=1` remains a cost guard
++
++### D. Separate expensive inference from finishing
++
++The B200 does only model inference and scene stitching. It then writes a staging master to the shared Volume and hands off to CPU.
++
++CPU finalization performs full-stream and pixel/statistical technical checks:
++
++- FFprobe stream/codec/duration/FPS inspection
++- black-frame detection
++- freeze detection
++- silence detection
++- audio mean/peak analysis
++- frame luminance and saturation signal statistics
++- thumbnail generation
++- final publish
++
++These checks inspect the actual output pixels/audio stream for technical defects; they are not a claim of semantic human-level understanding of every pixel.
++
++### E. Storage and health
++
++Development can keep using the persistent Modal Volume. Volume-backed video/thumbnail URLs are HMAC-signed so a guessed generation ID is not enough to fetch media. If S3-compatible credentials are present, masters, thumbnails and edit versions publish there automatically; use a private bucket/signed-CDN design if the S3 media itself must remain private.
++
++`/api/health` verifies PostgreSQL and the deployed Modal API. Security headers are enabled. Optional Basic Auth can protect a private/demo deployment; a public multi-user launch should replace that with real identity + authorization.
++
++---
++
++## Section 2 — Post-Production + Editing
++
++Completed videos now have a non-destructive editor. The original master is never overwritten; every edit creates a `VideoVersion` and gets its own QC report.
++
++### Editing tools implemented
++
++- trim start/end
++- 0.25×–4× speed with audio tempo correction
++- volume and mute
++- loudness normalization
++- audio/video fade in/out
++- brightness
++- contrast
++- saturation
++- sharpen
++- blur
++- cinematic vignette
++- 16:9 / 9:16 / 1:1 crop
++- 0° / 90° / 180° / 270° rotation
++- horizontal mirror
++- Cinematic / Vivid / Social / Clean presets
++- original + edited version history
++- delete edited versions and reclaim retained Volume/object-storage files
++- preview and download the selected version
++- technical QC + thumbnail for every edited version
++- editor concurrency and per-video version safety limits
++- deleting a terminal generation triggers retained media cleanup before the database row is removed
++
++All edit rendering runs on CPU FFmpeg workers, not the B200.
++
++### Capability boundary for the next production layer
++
++The stable worker in this package remains self-hosted Diffusers text-to-video. LTX-2.5 also supports image-to-video, audio-to-video, start/last-frame control and native multi-shot; the open-source ecosystem additionally exposes control/customization workflows such as LoRA/IC-LoRA. These should be added as explicit workflow adapters with their own input upload, validation, cancellation, QC and asset tests rather than silently bolted onto the stable text-to-video path.
++
++For exact dialogue, named voice consistency and lip synchronization, use a dedicated TTS + lip-sync stage. Native generated speech should not be treated as transcript-locked.
+diff --git a/README.md b/README.md
+index 55de653..b844faa 100644
+--- a/README.md
++++ b/README.md
+@@ -1,544 +1,123 @@
+-# Triven Cinema — One-Day MVP
++# Triven Cinema
+ 
+-A complete starter for the project described in the call: prompt -> optional AI storyboard -> LTX-2.5 -> serverless B200 -> MP4 -> object storage -> Triven Cinema UI.
++Production-oriented AI video generation studio built with Next.js, PostgreSQL/Prisma, Modal, LTX-2.5 and FFmpeg.
+ 
+-## What is included
++The app follows a deliberate two-part pipeline:
+ 
+-- Professional Next.js 16 studio UI
+-- Direct generation mode
+-- AI scene/storyboard mode with editable scenes
+-- Character/style continuity context
+-- 16:9, 9:16 and 1:1 output controls
+-- Preview and 1080p modes
+-- Native-audio toggle
+-- Prompt enhancement when `OPENAI_API_KEY` is configured
+-- PostgreSQL + Prisma generation history
+-- Async Modal job submission and polling
+-- Serverless B200 GPU worker
+-- LTX-2.5 Diffusers integration
+-- CPU model prefetch into persistent Modal Volume
+-- Two-stage latent upscaling path for 1080p
+-- FFmpeg cropping and scene concatenation
+-- Cloudflare R2 / S3-compatible upload
+-- GPU time + approximate GPU cost tracking
+-- `MOCK_MODE=true` for $0 local testing
++1. **AI Director + Generation** — analyze the brief, build continuity, isolate scenes, render with LTX-2.5 on B200, then run CPU quality control.
++2. **Post-Production + Editing** — non-destructive FFmpeg editing on CPU with version history and QC.
+ 
+-## Important scope
++See `PRODUCTION-PLAN.md` for the architecture and implemented feature set.
+ 
+-The ZIP does **not** include LTX-2.5 weights. They are very large and gated. You must accept the LTX model terms on Hugging Face and provide an `HF_TOKEN` to Modal.
+-
+-The one-day MVP intentionally enables only LTX-2.5. WAN / Seedance / other providers should be added behind the provider layer after the primary pipeline is stable.
+-
+----
+-
+-# 1. Prerequisites
+-
+-Install:
+-
+-- Node.js 20+ (22 recommended)
+-- npm
+-- Docker Desktop (for the easiest local PostgreSQL setup)
+-- Python 3.10+
+-- A Modal account
+-- A Hugging Face account with access to `Lightricks/LTX-2.5-Diffusers`
+-- A Cloudflare R2 bucket (or another S3-compatible bucket)
+-
+-For the first local UI test you need only Node, npm and Docker. You can keep `MOCK_MODE=true` and skip Modal/Hugging Face/R2.
+-
+----
+-
+-# 2. Fast local setup — no GPU cost
+-
+-From the project root:
++## Local setup
+ 
+ ```bash
+ cp .env.example .env
+-```
+-
+-Keep:
+-
+-```env
+-MOCK_MODE="true"
+-NEXT_PUBLIC_MOCK_MODE="true"
+-```
+-
+-Start PostgreSQL:
+-
+-```bash
+ docker compose up -d db
+-```
+-
+-Install packages:
+-
+-```bash
+-npm install
+-```
+-
+-Create Prisma tables:
+-
+-```bash
+-npx prisma migrate deploy
+-```
+-
+-Run the application:
+-
+-```bash
++npm ci
++npm run db:deploy
+ npm run dev
+ ```
+ 
+-Open:
++The Docker PostgreSQL service is exposed on host port `55432`.
+ 
+-```text
+-http://localhost:3000
+-```
++## Database upgrade
+ 
+-In mock mode, submitted generations return the bundled demo video. This verifies the UI, database, storyboard, generation records and result player before you spend any GPU money.
++This version adds cancellation states, director/QC data, render attempts and non-destructive video versions.
+ 
+----
+-
+-# 3. Optional scene-planning AI
+-
+-The app works without an LLM key; it uses a deterministic storyboard fallback.
+-
+-To enable AI planning/prompt enhancement, put this in `.env`:
+-
+-```env
+-OPENAI_API_KEY="your-key"
+-SCENE_PLANNER_MODEL="gpt-5-mini"
+-```
+-
+-You can replace this module later with Claude, Gemini, a local model, or Triven's own intelligence layer.
+-
+----
+-
+-# 4. Hugging Face access for LTX-2.5
+-
+-Open the LTX-2.5 Diffusers repository on Hugging Face and accept its access terms.
+-
+-Create a Hugging Face read token that can access gated repositories.
+-
+-Do **not** put the Hugging Face token into the Next.js frontend.
+-
+-It belongs only in the Modal secret.
+-
+----
+-
+-# 5. Create Cloudflare R2 storage
+-
+-Create a bucket, for example:
+-
+-```text
+-triven-cinema
++```bash
++npm run db:generate
++npm run db:deploy
+ ```
+ 
+-Create R2 API credentials with object read/write access to that bucket.
++Do not use `db:push` on production data.
+ 
+-You need:
++## Modal setup
+ 
+-```text
+-R2_ENDPOINT
+-R2_ACCESS_KEY_ID
+-R2_SECRET_ACCESS_KEY
+-R2_BUCKET
+-R2_PUBLIC_BASE_URL
+-```
+-
+-Typical endpoint format:
++The Modal secret `triven-cinema-runtime` must contain:
+ 
+ ```text
+-https://<ACCOUNT_ID>.r2.cloudflarestorage.com
++HF_TOKEN
++TRIVEN_WEB_SECRET
+ ```
+ 
+-`R2_PUBLIC_BASE_URL` must point to a public R2.dev URL or, preferably, a custom CDN domain that serves the bucket, for example:
++Optional production object storage can be enabled by adding:
+ 
+ ```text
+-https://cinema-cdn.triven.ai
+-```
+-
+----
+-
+-# 6. Install and authenticate Modal
+-
+-Install Modal:
+-
+-```bash
+-python3 -m pip install modal
+-```
+-
+-Authenticate:
+-
+-```bash
+-modal setup
+-```
+-
+-Create a strong random secret for communication between Next.js and Modal. On macOS/Linux:
+-
+-```bash
+-openssl rand -hex 32
+-```
+-
+-Save that value. You will use it as `TRIVEN_WEB_SECRET` and `MODAL_WEB_SECRET`.
+-
+----
+-
+-# 7. Create the Modal runtime secret
+-
+-Run this as one command, replacing the values:
+-
+-```bash
+-modal secret create triven-cinema-runtime \
+-  HF_TOKEN="hf_xxxxxxxxx" \
+-  TRIVEN_WEB_SECRET="your-long-random-secret" \
+-  R2_ENDPOINT="https://ACCOUNT_ID.r2.cloudflarestorage.com" \
+-  R2_ACCESS_KEY_ID="xxxxxxxxx" \
+-  R2_SECRET_ACCESS_KEY="xxxxxxxxx" \
+-  R2_BUCKET="triven-cinema" \
+-  R2_PUBLIC_BASE_URL="https://cinema-cdn.example.com"
++STORAGE_S3_ENDPOINT
++STORAGE_S3_ACCESS_KEY_ID
++STORAGE_S3_SECRET_ACCESS_KEY
++STORAGE_S3_BUCKET
++STORAGE_PUBLIC_BASE_URL
+ ```
+ 
+-Never commit these secrets.
+-
+----
+-
+-# 8. Prefetch LTX-2.5 on CPU
+-
+-This is important. It avoids using expensive B200 time to download the model.
++Any S3-compatible service can be used. Without these values, Triven uses the persistent Modal output Volume and serves media through HMAC-signed URLs derived from `TRIVEN_WEB_SECRET`.
+ 
+-From the repository root:
++Prefetch model assets once:
+ 
+ ```bash
+ modal run modal/cinema.py::prefetch_models
+ ```
+ 
+-This downloads the gated `Lightricks/LTX-2.5-Diffusers` repository into the persistent Modal Volume `triven-cinema-model-cache`.
+-
+-The first download is large. That is normal.
+-
+----
+-
+-# 9. Deploy the Modal GPU API
+-
+-Run:
++Deploy:
+ 
+ ```bash
+ modal deploy modal/cinema.py
+ ```
+ 
+-Modal will print a web endpoint for the `api` function. Copy that URL.
+-
+-Test it:
+-
+-```bash
+-curl https://YOUR-MODAL-ENDPOINT/health
+-```
+-
+-You should receive something similar to:
+-
+-```json
+-{"ok":true,"model":"LTX-2.5","gpu":"B200"}
+-```
+-
+----
+-
+-# 10. Connect Next.js to Modal
+-
+-Edit `.env`:
++Then put the deployed URL and matching secret in `.env`:
+ 
+ ```env
+ MOCK_MODE="false"
+ NEXT_PUBLIC_MOCK_MODE="false"
+ MODAL_API_URL="https://YOUR-MODAL-ENDPOINT"
+-MODAL_WEB_SECRET="the-same-secret-used-as-TRIVEN_WEB_SECRET"
+-```
+-
+-Restart Next.js:
+-
+-```bash
+-npm run dev
+-```
+-
+-Now a generation request follows this flow:
+-
+-```text
+-Browser
+- -> Next.js POST /api/generations
+- -> PostgreSQL Generation record
+- -> Modal POST /submit
+- -> B200 starts
+- -> LTX-2.5 renders
+- -> FFmpeg crops/stitches
+- -> R2 upload
+- -> Modal job state = COMPLETED
+- -> Next.js polls/syncs state
+- -> Browser displays final MP4
+- -> B200 scales to zero
+-```
+-
+----
+-
+-# 11. First paid test: use safe settings
+-
+-For the first real render use:
+-
+-```text
+-Mode: Direct
+-Aspect: 16:9
+-Quality: Preview / Fast
+-Duration: 5 seconds
+-Native audio: On
+-```
+-
+-Do not start with a 60-second 1080p scene-mode render.
+-
+-The Modal class is intentionally configured with:
+-
+-```python
+-min_containers=0
+-max_containers=1
+-scaledown_window=30
+-```
+-
+-That prevents the MVP from scaling to multiple B200 containers accidentally.
+-
+----
+-
+-# 12. How 1080p works
+-
+-The worker does not ask the model to start from a giant 1920x1080 latent.
+-
+-For 16:9 it uses a model-friendly source size:
+-
+-```text
+-960 x 544
+- -> LTX latent generation
+- -> 2x latent upscaler
+- -> stage-2 distilled refinement
+- -> 1920 x 1088
+- -> FFmpeg crop
+- -> 1920 x 1080
+-```
+-
+-For vertical:
+-
+-```text
+-544 x 960
+- -> x2
+- -> 1088 x 1920
+- -> crop
+- -> 1080 x 1920
+-```
+-
+-For square:
+-
+-```text
+-544 x 544
+- -> x2
+- -> 1088 x 1088
+- -> crop
+- -> 1080 x 1080
+-```
+-
+----
+-
+-# 13. Scene mode
+-
+-Scene mode calls `/api/plan` first and returns editable JSON-like scene objects.
+-
+-The user can edit each scene before generation.
+-
+-The app stores a `continuityContext` such as character identity, wardrobe, environment, lighting and lens language. The planner is instructed to preserve that continuity across scene prompts.
+-
+-In this MVP each scene is rendered independently and then joined with FFmpeg. A later version should add last-frame -> next-scene image conditioning for stronger visual continuity.
+-
+----
+-
+-# 14. Database
+-
+-Main tables:
+-
+-```text
+-Generation
+-Scene
+-```
+-
+-Useful commands:
+-
+-```bash
+-npm run db:studio
+-npm run db:migrate
+-npm run db:deploy
+-```
+-
+-To reset the local Docker database completely:
+-
+-```bash
+-docker compose down -v
+-docker compose up -d db
+-npx prisma migrate deploy
++MODAL_WEB_SECRET="same-value-as-TRIVEN_WEB_SECRET"
++TRIVEN_MAX_ACTIVE_GENERATIONS="2"
++TRIVEN_MAX_ACTIVE_EDITS="4"
++TRIVEN_MAX_VERSIONS_PER_GENERATION="20"
++TRIVEN_ACTIVE_STALE_HOURS="6"
+ ```
+ 
+----
++## Private/demo access guard
+ 
+-# 15. Production database
+-
+-Do not use the local Docker URL on Vercel.
+-
+-Create a managed PostgreSQL database on Neon, Supabase, Render, Railway, AWS RDS, etc.
+-
+-Set production:
++Set both values to enable HTTP Basic Auth across the app (except `/api/health`):
+ 
+ ```env
+-DATABASE_URL="postgresql://..."
+-```
+-
+-Then run:
+-
+-```bash
+-npx prisma migrate deploy
+-```
+-
+----
+-
+-# 16. Deploy the Next.js app
+-
+-Vercel is the simplest option.
+-
+-Push the project to GitHub, import it in Vercel, then add:
+-
+-```text
+-DATABASE_URL
+-MOCK_MODE=false
+-OPENAI_API_KEY              (optional)
+-SCENE_PLANNER_MODEL         (optional)
+-MODAL_API_URL
+-MODAL_WEB_SECRET
+-```
+-
+-Run the Prisma production migration against your production DB:
+-
+-```bash
+-DATABASE_URL="your-production-url" npx prisma migrate deploy
+-```
+-
+-No GPU dependencies need to be installed on Vercel. They live on Modal.
+-
+----
+-
+-# 17. Architecture
+-
+-```text
+-                            TRIVEN CINEMA
+-
+-  Browser / Next.js
+-         |
+-         +--> /api/plan ----------> Scene Planner
+-         |
+-         +--> /api/generations ---> PostgreSQL
+-                                      |
+-                                      +--> Modal /submit
+-                                             |
+-                                             v
+-                                      Serverless B200
+-                                             |
+-                                          LTX-2.5
+-                                             |
+-                                  +----------+----------+
+-                                  |                     |
+-                              Direct clip          Scene clips
+-                                  |                     |
+-                                  +----------+----------+
+-                                             |
+-                                           FFmpeg
+-                                             |
+-                                        Cloudflare R2
+-                                             |
+-                                      Public video URL
+-                                             |
+-                                Next.js status polling
+-                                             |
+-                                          Browser
+-```
+-
+----
+-
+-# 18. Cost tracking
+-
+-The worker records:
+-
+-```text
+-gpuSeconds
+-actualCost
++TRIVEN_BASIC_AUTH_USER="demo"
++TRIVEN_BASIC_AUTH_PASSWORD="use-a-long-random-password"
+ ```
+ 
+-The default B200 price constant in `modal/cinema.py` is:
+-
+-```python
+-B200_PRICE_PER_SECOND = 0.001736
+-```
++This is a deployment gate, not a replacement for user accounts/authorization in a public multi-user product.
+ 
+-Cloud GPU pricing changes. Update that constant when Modal pricing changes. Treat the displayed cost as an estimate of GPU runtime, not a complete accounting invoice.
++## Health
+ 
+----
++`GET /api/health` checks PostgreSQL and, when not in mock mode, the deployed Modal API.
+ 
+-# 19. Troubleshooting
++## Production validation
+ 
+-## Hugging Face 401 / 403
+-
+-You have not accepted the gated model terms, your token cannot read gated repositories, or the token is missing from the Modal secret.
+-
+-Recreate/update `triven-cinema-runtime`, then rerun:
++Run before deployment:
+ 
+ ```bash
+-modal run modal/cinema.py::prefetch_models
++npm run lint
++npm run build
++python3 -m py_compile modal/cinema.py
+ ```
+ 
+-## `Job not found`
+-
+-Ensure `MODAL_API_URL` points to the current deployed API endpoint and Next.js is sending the same secret as Modal expects.
+-
+-## R2 upload succeeds but the browser cannot play the video
+-
+-`R2_PUBLIC_BASE_URL` must be a public URL that actually serves the bucket. The S3 API endpoint itself is not normally a public media URL.
+-
+-## B200 is unavailable
+-
+-Modal GPU availability can vary. For temporary development you can change:
+-
+-```python
+-gpu="B200"
+-```
+-
+-to another GPU with enough memory, but performance and memory behavior will change. Keep B200 as the intended production target for this MVP.
+-
+-## Out of memory
+-
+-First test `preview` and 5 seconds. The current worker loads the primary pipeline and upsampler onto the B200. If you adapt it to smaller GPUs, use CPU offload/quantization rather than assuming the B200 configuration transfers directly.
+-
+-## FFmpeg concat error
+-
+-The generated scene clips should use identical output settings. If you later allow per-scene quality/ratio/fps settings, re-encode every clip to a common format before concatenating.
+-
+----
+-
+-# 20. What I would build next
+-
+-After the MVP is stable, add in this order:
++Then smoke-test:
+ 
+-1. Reference image upload + image-to-video.
+-2. Last-frame conditioning from Scene N into Scene N+1.
+-3. Scene-by-scene regeneration instead of regenerating the whole film.
+-4. Project/library UI with reusable characters and style bibles.
+-5. Queue limits, per-user quotas and billing.
+-6. WAN provider behind the same backend interface.
+-7. Premium Seedance provider for fallback/comparison.
+-8. ElevenLabs narration.
+-9. Remotion timeline with captions, logos, music and CTAs.
+-10. Research -> script -> shot plan -> render -> edit -> YouTube publish automation.
++1. 5-second Fast 1080p render.
++2. Cancel a queued render and immediately submit another.
++3. Multi-scene 30–60 second render.
++4. Pro render.
++5. Open the AI Director plan and QC report.
++6. Create an edited version (trim + color + audio normalization/finishing), wait for completion and preview it.
++7. Delete an edited version and confirm the original master still plays.
++8. Delete a terminal test generation and confirm its retained media is cleaned up.
+ 
+----
++## Important LTX-2.5 notes
+ 
+-# Security / production notes
++The UI supports 24, 25, 48 and 50 FPS as production LTX profiles. 30 FPS is retained as an **experimental self-hosted Diffusers option** and should be load-tested before depending on it.
+ 
+-Before public launch, add authentication, user ownership on generations, rate limits, content moderation, upload validation, signed/private media URLs where appropriate, billing limits, terms, model-license review and abuse controls.
++Native generated dialogue is not transcript-locked. For exact dialogue, named voices and production lip sync, add a dedicated TTS + lip-sync stage rather than relying on generative native speech alone.
+ 
+-This ZIP is a working MVP foundation, not a production security/compliance package.
++For character-critical projects, image conditioning/reference-control workflows are the correct next step; text-only continuity is probabilistic even with a strong continuity bible.
+diff --git a/START-HERE.md b/START-HERE.md
+index 9d7e88c..542e0ab 100644
+--- a/START-HERE.md
++++ b/START-HERE.md
+@@ -1,65 +1,33 @@
+-# START HERE
++# Start Here — Triven Cinema Production Upgrade
+ 
+-## A. Run the complete app locally without GPU cost
++This package is an upgrade of the supplied Triven Cinema project. It keeps the working Next.js -> Modal -> B200 -> LTX-2.5 pipeline, then adds production planning, safer job control, technical QC and a non-destructive CPU video editor.
+ 
+-```bash
+-cp .env.example .env
+-docker compose up -d db
+-npm install
+-npx prisma migrate deploy
+-npm run dev
+-```
+-
+-Open `http://localhost:3000`.
+-
+-Leave these values enabled for the first test:
+-
+-```env
+-MOCK_MODE="true"
+-NEXT_PUBLIC_MOCK_MODE="true"
+-```
+-
+-The UI, Prisma database, storyboard API, generation history and result player will work using the included mock MP4.
+-
+-## B. Turn on real LTX-2.5 rendering
++## Upgrade an existing local copy
+ 
+-1. Accept access to `Lightricks/LTX-2.5-Diffusers` on Hugging Face and create a read token.
+-2. Create a Cloudflare R2 bucket and public/custom-domain URL.
+-3. Install/authenticate Modal:
+-
+-```bash
+-python3 -m pip install modal
+-modal setup
+-```
+-
+-4. Create the Modal runtime secret using the exact command template in `README.md`.
+-5. Cache the model on CPU:
+-
+-```bash
+-modal run modal/cinema.py::prefetch_models
+-```
+-
+-6. Deploy the API:
++Back up the current project first. Then copy these files in place or apply the included production patch.
+ 
+ ```bash
++npm ci
++npm run db:generate
++npm run db:deploy
++npm run lint
++npm run build
++python3 -m py_compile modal/cinema.py
+ modal deploy modal/cinema.py
++npm run dev
+ ```
+ 
+-7. Copy the deployed Modal URL into `.env`, then change:
++The new Prisma migration is additive. Do **not** use `prisma db push` against production data.
+ 
+-```env
+-MOCK_MODE="false"
+-NEXT_PUBLIC_MOCK_MODE="false"
+-MODAL_API_URL="https://YOUR-MODAL-ENDPOINT"
+-MODAL_WEB_SECRET="YOUR_SHARED_SECRET"
+-```
+-
+-8. Restart:
++You do not need to re-prefetch LTX model weights unless the Modal model cache was deleted or you intentionally change the model assets.
+ 
+-```bash
+-npm run dev
+-```
++## First production smoke test
+ 
+-9. First paid render: Direct / 16:9 / Preview / 5 seconds.
++1. Open `/api/health` and confirm database + Modal are healthy.
++2. Generate a 5-second Fast / 1080p / 24 FPS video.
++3. Stop a second render while it is queued/generating, then immediately start another one.
++4. Generate a 30–60 second multi-scene prompt and inspect **AI Director plan**.
++5. Confirm the completed video has **Technical QC**.
++6. Open **Video editor**, make a trim/color/audio edit, and confirm a new version is created without replacing the original.
+ 
+-Read `README.md` for the full deployment, R2, database, architecture and troubleshooting guide.
++Read `PRODUCTION-PLAN.md` for what changed and `UPGRADE-CHECKLIST.md` before deployment.
+diff --git a/triven-patch-new/UPGRADE-CHECKLIST.md b/UPGRADE-CHECKLIST.md
+new file mode 100644
+index 0000000..5f041ee
+--- /dev/null
++++ b/UPGRADE-CHECKLIST.md
+@@ -0,0 +1,106 @@
++# Triven Cinema — Upgrade & Deployment Checklist
++
++## 1. Protect the current deployment
++
++- Back up `.env` and PostgreSQL.
++- Keep the old deployment available until the new health check and smoke test pass.
++- Do not paste `HF_TOKEN` or `TRIVEN_WEB_SECRET` into source control.
++
++## 2. Install and migrate
++
++```bash
++npm ci
++npm run db:generate
++npm run db:deploy
++```
++
++The migration adds `CANCEL_REQUESTED` / `CANCELLED` / `ANALYZING`, director/QC JSON, render-attempt audit rows and non-destructive `VideoVersion` rows.
++
++## 3. Validate locally
++
++```bash
++npm run lint
++npm run build
++python3 -m py_compile modal/cinema.py
++```
++
++Start PostgreSQL and the app, then test in mock mode first if desired.
++
++## 4. Configure production
++
++Next.js `.env`:
++
++```env
++MOCK_MODE="false"
++NEXT_PUBLIC_MOCK_MODE="false"
++MODAL_API_URL="https://YOUR-DEPLOYED-MODAL-ENDPOINT"
++MODAL_WEB_SECRET="same-value-as-TRIVEN_WEB_SECRET"
++TRIVEN_MAX_ACTIVE_GENERATIONS="2"
++TRIVEN_MAX_ACTIVE_EDITS="4"
++TRIVEN_MAX_VERSIONS_PER_GENERATION="20"
++TRIVEN_ACTIVE_STALE_HOURS="6"
++```
++
++Optional whole-app protection for a demo/private deployment:
++
++```env
++TRIVEN_BASIC_AUTH_USER="your-user"
++TRIVEN_BASIC_AUTH_PASSWORD="a-long-random-password"
++```
++
++Modal secret `triven-cinema-runtime`:
++
++```text
++HF_TOKEN
++TRIVEN_WEB_SECRET
++```
++
++Optional S3-compatible storage:
++
++```text
++STORAGE_S3_ENDPOINT
++STORAGE_S3_ACCESS_KEY_ID
++STORAGE_S3_SECRET_ACCESS_KEY
++STORAGE_S3_BUCKET
++STORAGE_PUBLIC_BASE_URL
++```
++
++## 5. Deploy Modal
++
++```bash
++modal deploy modal/cinema.py
++```
++
++No model prefetch is required for this upgrade if Fast + Pro weights are already cached. If the cache is missing:
++
++```bash
++modal run modal/cinema.py::prefetch_models
++```
++
++## 6. Health + smoke test
++
++```bash
++curl -i http://localhost:3000/api/health
++```
++
++Then validate:
++
++- Fast / 1080p / 24 FPS / 5 sec
++- cancellation while queued and while generating
++- immediate new render after cancellation
++- 30–60 sec scene plan and stitch
++- Pro mode
++- Technical QC report + thumbnail
++- edit: trim + crop + color + normalize audio
++- original master remains unchanged
++- edited version can be previewed/downloaded and deleted
++- deleting a terminal generation cleans its retained Modal Volume/object-storage prefix
++
++## 7. Production gates before public launch
++
++- Use persistent object storage/CDN rather than relying only on the Modal Volume for long-term retention. Volume-backed media is HMAC-signed; if using S3, choose private/signed delivery when content must not be public.
++- Put the app behind real user authentication/authorization if it becomes multi-user; Basic Auth is only a private/demo gate.
++- Add centralized error monitoring and alerting.
++- Load-test B200 queue/capacity limits and 4K/48–50 FPS paths before advertising them as guaranteed SLAs.
++- Add a dedicated TTS + lip-sync pipeline for transcript-locked dialogue.
++- Add image/reference-conditioned workflows for character-critical continuity.
+diff --git a/app/api/generations/[id]/cancel/route.ts b/app/api/generations/[id]/cancel/route.ts
+index 5b023a6..0c66487 100644
+--- a/app/api/generations/[id]/cancel/route.ts
++++ b/app/api/generations/[id]/cancel/route.ts
+@@ -3,32 +3,40 @@ import { cancelModalJob } from "@/lib/modal";
+ import { prisma } from "@/lib/prisma";
+ 
+ const MOCK_MODE = process.env.MOCK_MODE === "true";
+-const STOPPED_MESSAGE = "Generation stopped by user";
++
++const includeGeneration = {
++  scenes: { orderBy: { order: "asc" as const } },
++  versions: { orderBy: { createdAt: "desc" as const } },
++};
+ 
+ export async function POST(_: Request, { params }: { params: Promise<{ id: string }> }) {
+   const { id } = await params;
+-  const generation = await prisma.generation.findUnique({
+-    where: { id },
+-    include: { scenes: { orderBy: { order: "asc" } } },
+-  });
+-
++  const generation = await prisma.generation.findUnique({ where: { id }, include: includeGeneration });
+   if (!generation) return NextResponse.json({ error: "Generation not found" }, { status: 404 });
+ 
+-  if (["COMPLETED", "FAILED"].includes(generation.status)) {
+-    return NextResponse.json(generation);
+-  }
++  if (["COMPLETED", "FAILED", "CANCELLED"].includes(generation.status)) return NextResponse.json(generation);
+ 
+   try {
+-    if (!MOCK_MODE) await cancelModalJob(id);
++    if (MOCK_MODE) {
++      const stopped = await prisma.generation.update({
++        where: { id },
++        data: { status: "CANCELLED", progress: 0, statusMessage: "Generation stopped by user", error: null },
++        include: includeGeneration,
++      });
++      return NextResponse.json(stopped);
++    }
+ 
++    const remote = await cancelModalJob(id);
++    const status = remote.status === "CANCELLED" ? "CANCELLED" : "CANCEL_REQUESTED";
+     const stopped = await prisma.generation.update({
+       where: { id },
+       data: {
+-        status: "FAILED",
+-        statusMessage: STOPPED_MESSAGE,
++        status,
++        progress: remote.progress ?? generation.progress,
++        statusMessage: remote.message ?? (status === "CANCELLED" ? "Generation stopped by user" : "Stopping generation"),
+         error: null,
+       },
+-      include: { scenes: { orderBy: { order: "asc" } } },
++      include: includeGeneration,
+     });
+ 
+     return NextResponse.json(stopped);
+diff --git a/triven-patch-new/app/api/generations/[id]/edits/[versionId]/route.ts b/app/api/generations/[id]/edits/[versionId]/route.ts
+new file mode 100644
+index 0000000..f2f56dd
+--- /dev/null
++++ b/app/api/generations/[id]/edits/[versionId]/route.ts
+@@ -0,0 +1,49 @@
++import { NextResponse } from "next/server";
++import { Prisma } from "@prisma/client";
++import { prisma } from "@/lib/prisma";
++import { deleteModalEditVersion, getModalEdit } from "@/lib/modal";
++
++const MOCK_MODE = process.env.MOCK_MODE === "true";
++
++export async function GET(_: Request, { params }: { params: Promise<{ id: string; versionId: string }> }) {
++  const { id, versionId } = await params;
++  let version = await prisma.videoVersion.findFirst({ where: { id: versionId, generationId: id } });
++  if (!version) return NextResponse.json({ error: "Edit version not found" }, { status: 404 });
++
++  if (!MOCK_MODE && !["COMPLETED", "FAILED"].includes(version.status)) {
++    try {
++      const remote = await getModalEdit(versionId);
++      version = await prisma.videoVersion.update({
++        where: { id: versionId },
++        data: {
++          status: remote.status,
++          outputUrl: remote.outputUrl ?? version.outputUrl,
++          thumbnailUrl: remote.thumbnailUrl ?? version.thumbnailUrl,
++          qcReport: remote.qcReport ? remote.qcReport as Prisma.InputJsonValue : undefined,
++          error: remote.error ?? version.error,
++        },
++      });
++    } catch (error) {
++      console.error("Modal edit status sync failed", error);
++    }
++  }
++
++  return NextResponse.json(version);
++}
++
++export async function DELETE(_: Request, { params }: { params: Promise<{ id: string; versionId: string }> }) {
++  const { id, versionId } = await params;
++  const version = await prisma.videoVersion.findFirst({ where: { id: versionId, generationId: id } });
++  if (!version) return NextResponse.json({ success: true, deleted: false });
++  if (["QUEUED", "PROCESSING"].includes(version.status)) {
++    return NextResponse.json({ error: "Wait for this edit to finish before deleting it." }, { status: 409 });
++  }
++  try {
++    if (!MOCK_MODE) await deleteModalEditVersion(id, versionId);
++    await prisma.videoVersion.delete({ where: { id: versionId } });
++    return NextResponse.json({ success: true, deleted: true });
++  } catch (error) {
++    console.error("Edit version delete failed", error);
++    return NextResponse.json({ error: "Could not delete this edit version" }, { status: 500 });
++  }
++}
+diff --git a/triven-patch-new/app/api/generations/[id]/edits/route.ts b/app/api/generations/[id]/edits/route.ts
+new file mode 100644
+index 0000000..bd4a173
+--- /dev/null
++++ b/app/api/generations/[id]/edits/route.ts
+@@ -0,0 +1,75 @@
++import { NextResponse } from "next/server";
++import { Prisma } from "@prisma/client";
++import { prisma } from "@/lib/prisma";
++import { editRequestSchema } from "@/lib/schemas";
++import { submitModalEdit } from "@/lib/modal";
++
++const MOCK_MODE = process.env.MOCK_MODE === "true";
++const MAX_ACTIVE_EDITS = Math.max(1, Number(process.env.TRIVEN_MAX_ACTIVE_EDITS || 4));
++const MAX_VERSIONS_PER_GENERATION = Math.max(1, Number(process.env.TRIVEN_MAX_VERSIONS_PER_GENERATION || 20));
++
++export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
++  const { id } = await params;
++  const versions = await prisma.videoVersion.findMany({ where: { generationId: id }, orderBy: { createdAt: "desc" } });
++  return NextResponse.json(versions);
++}
++
++export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
++  const { id } = await params;
++  try {
++    const input = editRequestSchema.parse(await request.json());
++    const generation = await prisma.generation.findUnique({ where: { id } });
++    if (!generation) return NextResponse.json({ error: "Generation not found" }, { status: 404 });
++    if (generation.status !== "COMPLETED" || !generation.outputUrl) {
++      return NextResponse.json({ error: "The source video must be completed before editing." }, { status: 409 });
++    }
++
++    if (!MOCK_MODE) {
++      const [activeEdits, versionCount] = await Promise.all([
++        prisma.videoVersion.count({ where: { status: { in: ["QUEUED", "PROCESSING"] } } }),
++        prisma.videoVersion.count({ where: { generationId: id } }),
++      ]);
++      if (activeEdits >= MAX_ACTIVE_EDITS) {
++        return NextResponse.json({ error: `Editor capacity is busy (${activeEdits}/${MAX_ACTIVE_EDITS}). Wait for an active edit to finish.` }, { status: 429 });
++      }
++      if (versionCount >= MAX_VERSIONS_PER_GENERATION) {
++        return NextResponse.json({ error: `This video already has ${versionCount} edited versions. Delete or archive older versions before creating more.` }, { status: 409 });
++      }
++    }
++
++    const version = await prisma.videoVersion.create({
++      data: {
++        generationId: id,
++        label: input.label,
++        status: MOCK_MODE ? "COMPLETED" : "QUEUED",
++        outputUrl: MOCK_MODE ? generation.outputUrl : null,
++        operations: input.operations as Prisma.InputJsonValue,
++      },
++    });
++
++    if (MOCK_MODE) return NextResponse.json(version, { status: 201 });
++
++    try {
++      const job = await submitModalEdit({
++        generationId: id,
++        versionId: version.id,
++        sourceUrl: generation.outputUrl,
++        operations: input.operations,
++      });
++      const updated = await prisma.videoVersion.update({
++        where: { id: version.id },
++        data: { providerJobId: job.callId },
++      });
++      return NextResponse.json(updated, { status: 201 });
++    } catch (error) {
++      const message = error instanceof Error ? error.message : "Could not start video edit";
++      const failed = await prisma.videoVersion.update({
++        where: { id: version.id },
++        data: { status: "FAILED", error: message },
++      });
++      return NextResponse.json(failed, { status: 502 });
++    }
++  } catch (error) {
++    return NextResponse.json({ error: error instanceof Error ? error.message : "Invalid edit request" }, { status: 400 });
++  }
++}
+diff --git a/app/api/generations/[id]/route.ts b/app/api/generations/[id]/route.ts
+index 84db623..c52dff6 100644
+--- a/app/api/generations/[id]/route.ts
++++ b/app/api/generations/[id]/route.ts
+@@ -1,33 +1,64 @@
+ import { NextResponse } from "next/server";
++import { Prisma } from "@prisma/client";
+ import { prisma } from "@/lib/prisma";
+-import { getModalJob } from "@/lib/modal";
++import { deleteModalGeneration, getModalJob } from "@/lib/modal";
++import type { GenerationStatus } from "@/lib/types";
+ 
+ const MOCK_MODE = process.env.MOCK_MODE === "true";
+-const modalToDb: Record<string, "QUEUED" | "GENERATING" | "STITCHING" | "UPLOADING" | "COMPLETED" | "FAILED"> = {
+-  QUEUED: "QUEUED", GENERATING: "GENERATING", STITCHING: "STITCHING", UPLOADING: "UPLOADING", COMPLETED: "COMPLETED", FAILED: "FAILED",
++const TERMINAL: GenerationStatus[] = ["COMPLETED", "FAILED", "CANCELLED"];
++const modalToDb: Record<string, GenerationStatus> = {
++  QUEUED: "QUEUED",
++  PLANNING: "PLANNING",
++  GENERATING: "GENERATING",
++  STITCHING: "STITCHING",
++  UPLOADING: "UPLOADING",
++  ANALYZING: "ANALYZING",
++  CANCEL_REQUESTED: "CANCEL_REQUESTED",
++  CANCELLED: "CANCELLED",
++  COMPLETED: "COMPLETED",
++  FAILED: "FAILED",
++};
++
++const includeGeneration = {
++  scenes: { orderBy: { order: "asc" as const } },
++  versions: { orderBy: { createdAt: "desc" as const } },
+ };
+ 
+ export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
+   const { id } = await params;
+-  let generation = await prisma.generation.findUnique({ where: { id }, include: { scenes: { orderBy: { order: "asc" } } } });
++  let generation = await prisma.generation.findUnique({ where: { id }, include: includeGeneration });
+   if (!generation) return NextResponse.json({ error: "Generation not found" }, { status: 404 });
+ 
+-  if (!MOCK_MODE && !["COMPLETED", "FAILED"].includes(generation.status)) {
++  if (!MOCK_MODE && !TERMINAL.includes(generation.status as GenerationStatus)) {
+     try {
+       const remote = await getModalJob(id);
++      const nextStatus = modalToDb[remote.status] || generation.status;
+       generation = await prisma.generation.update({
+         where: { id },
+         data: {
+-          status: modalToDb[remote.status] || generation.status,
++          status: nextStatus,
+           progress: remote.progress ?? generation.progress,
+           statusMessage: remote.message ?? generation.statusMessage,
+           outputUrl: remote.outputUrl ?? generation.outputUrl,
++          thumbnailUrl: remote.thumbnailUrl ?? generation.thumbnailUrl,
+           gpuSeconds: remote.gpuSeconds ?? generation.gpuSeconds,
+           actualCost: remote.actualCost ?? generation.actualCost,
++          qcReport: remote.qcReport ? remote.qcReport as Prisma.InputJsonValue : undefined,
+           error: remote.error ?? generation.error,
+         },
+-        include: { scenes: { orderBy: { order: "asc" } } },
++        include: includeGeneration,
+       });
++
++      if (generation.providerJobId) {
++        await prisma.renderAttempt.updateMany({
++          where: { generationId: id, providerJobId: generation.providerJobId, finishedAt: null },
++          data: {
++            status: nextStatus,
++            error: remote.error ?? null,
++            finishedAt: TERMINAL.includes(nextStatus as GenerationStatus) ? new Date() : undefined,
++          },
++        });
++      }
+     } catch (error) {
+       console.error("Modal status sync failed", error);
+     }
+@@ -39,6 +70,12 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
+ export async function DELETE(_: Request, { params }: { params: Promise<{ id: string }> }) {
+   const { id } = await params;
+   try {
++    const generation = await prisma.generation.findUnique({ where: { id }, select: { status: true } });
++    if (!generation) return NextResponse.json({ success: true, deleted: false });
++    if (!["COMPLETED", "FAILED", "CANCELLED"].includes(generation.status)) {
++      return NextResponse.json({ error: "Stop the active generation before deleting it." }, { status: 409 });
++    }
++    if (!MOCK_MODE) await deleteModalGeneration(id);
+     const result = await prisma.generation.deleteMany({ where: { id } });
+     return NextResponse.json({ success: true, deleted: result.count > 0 });
+   } catch (error) {
+diff --git a/app/api/generations/route.ts b/app/api/generations/route.ts
+index 0c6d926..30b86c9 100644
+--- a/app/api/generations/route.ts
++++ b/app/api/generations/route.ts
+@@ -1,27 +1,94 @@
+ import { NextResponse } from "next/server";
++import { Prisma } from "@prisma/client";
+ import { prisma } from "@/lib/prisma";
+ import { generationSchema } from "@/lib/schemas";
+-import { enhanceVideoPrompt } from "@/lib/scene-planner";
++import { analyzeVideoPrompt, enhanceVideoPrompt } from "@/lib/scene-planner";
+ import { submitModalJob } from "@/lib/modal";
++import type { ScenePlanItem } from "@/lib/types";
+ 
+ const MOCK_MODE = process.env.MOCK_MODE === "true";
++const MAX_ACTIVE_GENERATIONS = Math.max(1, Number(process.env.TRIVEN_MAX_ACTIVE_GENERATIONS || 2));
++const ACTIVE_STALE_HOURS = Math.max(1, Number(process.env.TRIVEN_ACTIVE_STALE_HOURS || 6));
++
++function clipLimit(renderMode: "fast" | "pro", resolution: string, fps: number) {
++  return renderMode === "pro" || resolution === "1440p" || resolution === "4k" || fps >= 30 ? 10 : 20;
++}
++
++function normalizeScenesForProfile(
++  scenes: ScenePlanItem[] | undefined,
++  renderMode: "fast" | "pro",
++  resolution: string,
++  fps: number,
++): ScenePlanItem[] | undefined {
++  if (!scenes?.length) return undefined;
++  const limit = clipLimit(renderMode, resolution, fps);
++  const output: ScenePlanItem[] = [];
++  for (const scene of scenes) {
++    const chunks = Math.max(1, Math.ceil(scene.duration / limit));
++    let remaining = scene.duration;
++    for (let index = 0; index < chunks; index += 1) {
++      const duration = Math.min(limit, remaining);
++      remaining -= duration;
++      output.push({
++        ...scene,
++        order: output.length + 1,
++        title: chunks > 1 ? `${scene.title} - part ${index + 1}` : scene.title,
++        duration,
++        prompt: chunks > 1
++          ? `${scene.prompt} CONTINUATION ${index + 1} OF ${chunks}: preserve the exact same identities, environment, lighting, screen direction, and action continuity from the preceding part. Do not restart or reintroduce the scene.`
++          : scene.prompt,
++      });
++    }
++  }
++  return output;
++}
++
++const includeGeneration = {
++  scenes: { orderBy: { order: "asc" as const } },
++  versions: { orderBy: { createdAt: "desc" as const } },
++};
+ 
+ export async function GET(request: Request) {
+   const url = new URL(request.url);
+-  const limit = Math.min(20, Math.max(1, Number(url.searchParams.get("limit") || 8)));
+-  const rows = await prisma.generation.findMany({ orderBy: { createdAt: "desc" }, take: limit, include: { scenes: { orderBy: { order: "asc" } } } });
++  const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") || 20)));
++  const rows = await prisma.generation.findMany({ orderBy: { createdAt: "desc" }, take: limit, include: includeGeneration });
+   return NextResponse.json(rows);
+ }
+ 
+ export async function POST(request: Request) {
+   try {
+     const input = generationSchema.parse(await request.json());
+-    const enhancedPrompt = input.enhancePrompt ? await enhanceVideoPrompt(input.prompt, input.continuityContext) : input.prompt;
++
++    if (input.clientRequestId) {
++      const existing = await prisma.generation.findUnique({ where: { clientRequestId: input.clientRequestId }, include: includeGeneration });
++      if (existing) return NextResponse.json(existing, { status: 200 });
++    }
++
++    if (!MOCK_MODE) {
++      const active = await prisma.generation.count({
++        where: {
++          status: { in: ["QUEUED", "PLANNING", "GENERATING", "STITCHING", "UPLOADING", "ANALYZING", "CANCEL_REQUESTED"] },
++          updatedAt: { gte: new Date(Date.now() - ACTIVE_STALE_HOURS * 60 * 60 * 1000) },
++        },
++      });
++      if (active >= MAX_ACTIVE_GENERATIONS) {
++        return NextResponse.json({ error: `Render capacity is busy (${active}/${MAX_ACTIVE_GENERATIONS}). Wait for an active render to finish or stop it before starting another.` }, { status: 429 });
++      }
++    }
++
++    const analysis = analyzeVideoPrompt(input.prompt);
++    const enhancedPrompt = input.enhancePrompt ? await enhanceVideoPrompt(input.prompt, input.continuityContext || analysis.continuity) : input.prompt;
+     const seed = input.seed ?? Math.floor(Math.random() * 2_147_483_647);
+     const nativeAudio = input.audioQuality !== "off" && input.nativeAudio;
++    const normalizedScenes = input.mode === "SCENES"
++      ? normalizeScenesForProfile(input.scenes, input.renderMode, input.resolution, input.fps)
++      : undefined;
+ 
+-    const generation = await prisma.generation.create({
++    let generation: Prisma.GenerationGetPayload<{ include: typeof includeGeneration }>;
++    try {
++      generation = await prisma.generation.create({
+       data: {
++        clientRequestId: input.clientRequestId,
+         prompt: input.prompt,
+         enhancedPrompt,
+         mode: input.mode,
+@@ -36,24 +103,49 @@ export async function POST(request: Request) {
+         progress: MOCK_MODE ? 100 : 2,
+         statusMessage: MOCK_MODE ? "Mock render complete" : "Queued for GPU",
+         outputUrl: MOCK_MODE ? "/demo/triven-cinema-demo.mp4" : null,
++        thumbnailUrl: null,
+         gpuType: MOCK_MODE ? "MOCK" : "B200",
+         gpuSeconds: MOCK_MODE ? 0 : null,
+         actualCost: MOCK_MODE ? 0 : null,
++        analysis: analysis as Prisma.InputJsonValue,
+         metadata: {
+-          continuityContext: input.continuityContext || null,
++          continuityContext: input.continuityContext || analysis.continuity,
+           videoType: input.videoType,
+           renderMode: input.renderMode,
+           resolution: input.resolution,
+           fps: input.fps,
+           audioQuality: input.audioQuality,
+           mockMode: MOCK_MODE,
++          profileClipLimitSeconds: clipLimit(input.renderMode, input.resolution, input.fps),
+         },
+-        scenes: input.mode === "SCENES" && input.scenes ? {
+-          create: input.scenes.map(scene => ({ order: scene.order, title: scene.title, prompt: scene.prompt, duration: scene.duration, seed })),
++        scenes: input.mode === "SCENES" && normalizedScenes ? {
++          create: normalizedScenes.map((scene) => ({
++            order: scene.order,
++            title: scene.title,
++            prompt: scene.prompt,
++            duration: scene.duration,
++            seed,
++            metadata: {
++              visual: scene.visual || null,
++              action: scene.action || null,
++              camera: scene.camera || null,
++              audio: scene.audio || null,
++              dialogue: scene.dialogue || null,
++              transition: scene.transition || null,
++              mustHave: scene.mustHave || [],
++            },
++          })),
+         } : undefined,
+       },
+-      include: { scenes: { orderBy: { order: "asc" } } },
++      include: includeGeneration,
+     });
++    } catch (error) {
++      if (input.clientRequestId && error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
++        const existing = await prisma.generation.findUnique({ where: { clientRequestId: input.clientRequestId }, include: includeGeneration });
++        if (existing) return NextResponse.json(existing, { status: 200 });
++      }
++      throw error;
++    }
+ 
+     if (MOCK_MODE) return NextResponse.json(generation, { status: 201 });
+ 
+@@ -71,12 +163,32 @@ export async function POST(request: Request) {
+         durationSeconds: input.durationSeconds,
+         nativeAudio,
+         seed,
+-        scenes: input.mode === "SCENES" ? input.scenes?.map((scene) => ({ ...scene, prompt: `${input.continuityContext ? `${input.continuityContext} ` : ""}${scene.prompt}` })) : undefined,
++        scenes: input.mode === "SCENES" ? normalizedScenes?.map((scene) => ({
++          ...scene,
++          prompt: `${input.continuityContext || analysis.continuity} ${scene.prompt}`.slice(0, 11800),
++        })) : undefined,
++      });
++
++      await prisma.renderAttempt.create({
++        data: { generationId: generation.id, providerJobId: job.callId, status: "QUEUED" },
++      });
++
++      const updated = await prisma.generation.update({
++        where: { id: generation.id },
++        data: { providerJobId: job.callId },
++        include: includeGeneration,
+       });
+-      const updated = await prisma.generation.update({ where: { id: generation.id }, data: { providerJobId: job.callId }, include: { scenes: { orderBy: { order: "asc" } } } });
+       return NextResponse.json(updated, { status: 201 });
+     } catch (error) {
+-      const failed = await prisma.generation.update({ where: { id: generation.id }, data: { status: "FAILED", progress: 0, error: error instanceof Error ? error.message : "GPU job submission failed", statusMessage: "Could not start GPU job" }, include: { scenes: true } });
++      const message = error instanceof Error ? error.message : "GPU job submission failed";
++      await prisma.renderAttempt.create({
++        data: { generationId: generation.id, status: "FAILED", error: message, finishedAt: new Date() },
++      });
++      const failed = await prisma.generation.update({
++        where: { id: generation.id },
++        data: { status: "FAILED", progress: 0, error: message, statusMessage: "Could not start GPU job" },
++        include: includeGeneration,
++      });
+       return NextResponse.json(failed, { status: 502 });
+     }
+   } catch (error) {
+diff --git a/triven-patch-new/app/api/health/route.ts b/app/api/health/route.ts
+new file mode 100644
+index 0000000..3b603fb
+--- /dev/null
++++ b/app/api/health/route.ts
+@@ -0,0 +1,42 @@
++import { NextResponse } from "next/server";
++import { prisma } from "@/lib/prisma";
++import { getModalHealth } from "@/lib/modal";
++
++const MOCK_MODE = process.env.MOCK_MODE === "true";
++
++export async function GET() {
++  const checkedAt = new Date().toISOString();
++  let database = false;
++  let modal: "ok" | "skipped" | "error" = MOCK_MODE ? "skipped" : "error";
++  let modalDetail: unknown = null;
++
++  try {
++    await prisma.$queryRaw`SELECT 1`;
++    database = true;
++  } catch (error) {
++    console.error("Health check database failure", error);
++  }
++
++  if (!MOCK_MODE) {
++    try {
++      modalDetail = await getModalHealth();
++      modal = "ok";
++    } catch (error) {
++      modalDetail = error instanceof Error ? error.message : "Modal health check failed";
++      console.error("Health check Modal failure", error);
++    }
++  }
++
++  const ok = database && (MOCK_MODE || modal === "ok");
++  return NextResponse.json(
++    {
++      ok,
++      checkedAt,
++      mode: MOCK_MODE ? "mock" : "modal",
++      database: database ? "ok" : "error",
++      modal,
++      modalDetail,
++    },
++    { status: ok ? 200 : 503, headers: { "Cache-Control": "no-store" } },
++  );
++}
+diff --git a/app/globals.css b/app/globals.css
+index 46b1b35..c5674aa 100644
+--- a/app/globals.css
++++ b/app/globals.css
+@@ -647,3 +647,161 @@ button { transition: background .18s, color .18s, opacity .18s, transform .18s,
+ .stoppedCard p {
+   color: #c7b99f;
+ }
++
++/* Production director + QC + non-destructive editor */
++.directorPanel,
++.videoEditor,
++.qcCard {
++  margin-top: 14px;
++  border: 1px solid #2c2e34;
++  background: #17181c;
++  border-radius: 16px;
++  overflow: hidden;
++}
++
++.directorPanel > summary,
++.editorToggle {
++  width: 100%;
++  min-height: 54px;
++  padding: 0 16px;
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 14px;
++  background: transparent;
++  color: #f7f7f8;
++  border: 0;
++  cursor: pointer;
++  font: inherit;
++  list-style: none;
++}
++
++.directorPanel > summary::-webkit-details-marker { display: none; }
++.directorPanel > summary span,
++.editorToggle span { font-weight: 650; letter-spacing: -.01em; }
++.directorPanel > summary small,
++.editorToggle small { color: #8d9099; font-size: 12px; }
++
++.directorBody,
++.editorBody {
++  border-top: 1px solid #292b30;
++  padding: 16px;
++}
++
++.directorGrid {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++  gap: 10px;
++}
++
++.directorGrid > div,
++.directorFacts,
++.directorWarnings,
++.shotCard {
++  background: #1d1f24;
++  border: 1px solid #292c32;
++  border-radius: 12px;
++}
++
++.directorGrid > div { padding: 12px; }
++.directorGrid span,
++.directorFacts strong,
++.directorWarnings strong {
++  display: block;
++  color: #9da1aa;
++  font-size: 11px;
++  font-weight: 700;
++  text-transform: uppercase;
++  letter-spacing: .08em;
++}
++.directorGrid p,
++.directorWarnings p,
++.shotCard p { margin: 6px 0 0; color: #d8d9dd; font-size: 13px; line-height: 1.55; }
++
++.directorFacts,
++.directorWarnings { margin-top: 10px; padding: 12px; }
++.directorFacts { display: grid; gap: 10px; }
++.directorFacts div { display: grid; gap: 5px; }
++.directorFacts span { color: #d5d6da; font-size: 13px; line-height: 1.5; }
++.directorWarnings p { color: #c7bda9; }
++
++.shotList { display: grid; gap: 8px; margin-top: 12px; }
++.shotCard { padding: 11px 12px; display: grid; grid-template-columns: 34px 1fr; gap: 10px; }
++.shotIndex { color: #777b85; font-size: 11px; font-weight: 750; padding-top: 2px; }
++.shotCard strong { color: #f2f2f4; font-size: 13px; }
++.shotCard small { margin-left: 8px; color: #8d9099; }
++.shotCard p { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
++
++.qcCard { padding: 14px 15px; }
++.qcScore { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
++.qcScore span { color: #a3a6ad; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
++.qcScore strong { color: #f7f7f8; font-size: 20px; }
++.qcFacts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
++.qcFacts span { padding: 5px 8px; border-radius: 8px; background: #22242a; color: #bfc1c7; font-size: 11px; }
++.qcIssue { margin: 9px 0 0; font-size: 12px; color: #b9bbc1; line-height: 1.45; }
++.qcIssue.warning { color: #d3bc8b; }
++.qcIssue.error { color: #e09a9f; }
++
++.videoEditor { margin-top: 14px; }
++.editorToggle { text-align: left; }
++.editorToolbar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
++.editorToolbar label,
++.editorGrid label { display: grid; gap: 6px; }
++.editorToolbar span,
++.editorGrid span { color: #9a9da5; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
++.editorToolbar select,
++.editorGrid input[type="number"] {
++  width: 100%;
++  height: 38px;
++  border: 1px solid #32353c;
++  border-radius: 9px;
++  background: #111216;
++  color: #f3f3f4;
++  padding: 0 10px;
++  font: inherit;
++  font-size: 13px;
++}
++.editorGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px 12px; margin-top: 14px; }
++.editorGrid label { min-width: 0; }
++.editorGrid input[type="range"] { width: 100%; accent-color: #e4e4e6; }
++.editorGrid strong { color: #dadbe0; font-size: 12px; font-weight: 600; }
++.editorGrid small { color: #6f727b; font-size: 10px; }
++.editorChecks { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 15px; }
++.editorChecks label { display: flex; align-items: center; gap: 7px; color: #c9cad0; font-size: 12px; }
++.editorActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
++.secondaryEditButton,
++.primaryEditButton,
++.versionStrip button {
++  border-radius: 9px;
++  border: 1px solid #34373e;
++  min-height: 36px;
++  padding: 0 12px;
++  font: inherit;
++  font-size: 12px;
++  cursor: pointer;
++}
++.secondaryEditButton,
++.versionStrip button { background: #202228; color: #d7d8dd; }
++.primaryEditButton { background: #f0f0f2; color: #111216; border-color: #f0f0f2; font-weight: 700; }
++.primaryEditButton:disabled { opacity: .55; cursor: wait; }
++.editorError { color: #e09a9f; font-size: 12px; margin: 10px 0 0; }
++.versionStrip { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; border-top: 1px solid #292b30; margin-top: 16px; padding-top: 14px; }
++.versionStrip strong { color: #9a9da5; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin-right: 4px; }
++.versionStrip button:disabled { opacity: .48; cursor: wait; }
++
++.versionPill { display: inline-flex; align-items: stretch; border: 1px solid #34373e; border-radius: 9px; overflow: hidden; }
++.versionPill > button { border: 0; border-radius: 0; }
++.versionPill .versionDelete { min-width: 32px; padding: 0 9px; border-left: 1px solid #34373e; color: #b9bbc1; font-size: 16px; line-height: 1; }
++.versionPill .versionDelete:hover:not(:disabled) { color: #fff; background: #38262a; }
++.versionPill .versionDelete:disabled { opacity: .4; cursor: wait; }
++
++@media (max-width: 760px) {
++  .directorGrid,
++  .editorToolbar,
++  .editorGrid { grid-template-columns: 1fr; }
++  .directorPanel > summary,
++  .editorToggle { align-items: flex-start; flex-direction: column; justify-content: center; padding-top: 11px; padding-bottom: 11px; }
++  .editorActions { flex-direction: column-reverse; }
++  .secondaryEditButton,
++  .primaryEditButton { width: 100%; }
++}
+diff --git a/components/cinema/chat-model.ts b/components/cinema/chat-model.ts
+index f13d5cc..a5d9829 100644
+--- a/components/cinema/chat-model.ts
++++ b/components/cinema/chat-model.ts
+@@ -2,12 +2,15 @@ import type {
+   AspectRatio,
+   AudioQuality,
+   FrameRate,
++  ProductionBrief,
++  QCReport,
+   Quality,
+   RenderMode,
+   Resolution,
+   ScenePlanItem,
+   StoredQuality,
+   VideoType,
++  VideoVersionState,
+ } from "@/lib/types";
+ 
+ export type PromptSettings = {
+@@ -41,7 +44,6 @@ function clamp(value: number, min: number, max: number) {
+ 
+ export function detectVideoType(prompt: string): VideoType {
+   const normalized = prompt.toLowerCase();
+-
+   if (/cartoon|animation|animated|3d\s+animated|kids?\s+animation|children'?s?\s+cartoon/.test(normalized)) return "cartoon";
+   if (/product\s*(?:ad|advert|advertisement)|commercial|ugc\s+ad|brand\s+ad|product\s+launch/.test(normalized)) return "product-ad";
+   if (/explainer|explain\s+how|how\s+it\s+works|tutorial|walkthrough|educational\s+video/.test(normalized)) return "explainer";
+@@ -66,13 +68,10 @@ export function normalizeQuality(quality?: StoredQuality | string | null): Quali
+     case "draft": return "draft";
+     case "standard": return "standard";
+     case "high":
+-    case "preview":
+-      return "high";
++    case "preview": return "high";
+     case "ultra":
+-    case "1080p":
+-      return "ultra";
+-    default:
+-      return "standard";
++    case "1080p": return "ultra";
++    default: return "standard";
+   }
+ }
+ 
+@@ -107,24 +106,9 @@ export function audioQualityLabel(quality: AudioQuality) {
+ }
+ 
+ export function outputResolution(aspectRatio: AspectRatio, resolution: Resolution) {
+-  const landscape: Record<Resolution, string> = {
+-    "720p": "1280x720",
+-    "1080p": "1920x1080",
+-    "1440p": "2560x1440",
+-    "4k": "3840x2160",
+-  };
+-  const portrait: Record<Resolution, string> = {
+-    "720p": "720x1280",
+-    "1080p": "1080x1920",
+-    "1440p": "1440x2560",
+-    "4k": "2160x3840",
+-  };
+-  const square: Record<Resolution, string> = {
+-    "720p": "720x720",
+-    "1080p": "1080x1080",
+-    "1440p": "1440x1440",
+-    "4k": "2160x2160",
+-  };
++  const landscape: Record<Resolution, string> = { "720p": "1280x720", "1080p": "1920x1080", "1440p": "2560x1440", "4k": "3840x2160" };
++  const portrait: Record<Resolution, string> = { "720p": "720x1280", "1080p": "1080x1920", "1440p": "1440x2560", "4k": "2160x3840" };
++  const square: Record<Resolution, string> = { "720p": "720x720", "1080p": "1080x1080", "1440p": "1440x1440", "4k": "2160x2160" };
+   if (aspectRatio === "9:16") return portrait[resolution];
+   if (aspectRatio === "1:1") return square[resolution];
+   return landscape[resolution];
+@@ -151,16 +135,10 @@ export function inferPromptSettings(prompt: string, overrides: PromptOverrides =
+   const totalDuration = normalized.match(/(?:total\s+(?:video\s+)?duration\s*[:=-]?\s*(?:approximately\s*)?|create\s+a\s+)(\d{1,3})\s*(?:-|\s)?seconds?/i);
+   const genericDuration = normalized.match(/\b(\d{1,3})\s*(?:-|\s)?seconds?\b/i);
+   const sceneRanges = [...normalized.matchAll(/SCENE\s+\d+[^\n]*?(\d{1,3})\s*-\s*(\d{1,3})\s*seconds?/gi)];
+-
+   if (totalDuration?.[1]) inferredDuration = Number(totalDuration[1]);
+   else if (sceneRanges.length) inferredDuration = Math.max(...sceneRanges.map((match) => Number(match[2])));
+   else if (genericDuration?.[1]) inferredDuration = Number(genericDuration[1]);
+-
+-  const durationSeconds = clamp(
+-    overrides.durationSeconds && overrides.durationSeconds !== "auto" ? overrides.durationSeconds : inferredDuration,
+-    5,
+-    60,
+-  );
++  const durationSeconds = clamp(overrides.durationSeconds && overrides.durationSeconds !== "auto" ? overrides.durationSeconds : inferredDuration, 5, 180);
+ 
+   const detectedVideoType = detectVideoType(prompt);
+   const videoType = overrides.videoType && overrides.videoType !== "auto" ? overrides.videoType : detectedVideoType;
+@@ -173,7 +151,6 @@ export function inferPromptSettings(prompt: string, overrides: PromptOverrides =
+   if (/\b(?:4k|2160p|3840\s*[x×]\s*2160|2160\s*[x×]\s*3840)\b/i.test(normalized)) inferredResolution = "4k";
+   else if (/\b(?:1440p|2k|2560\s*[x×]\s*1440|1440\s*[x×]\s*2560)\b/i.test(normalized)) inferredResolution = "1440p";
+   else if (/\b(?:720p|1280\s*[x×]\s*720|720\s*[x×]\s*1280)\b/i.test(normalized)) inferredResolution = "720p";
+-  else if (/\b(?:1080p|full\s*hd|fhd|1920\s*[x×]\s*1080|1080\s*[x×]\s*1920)\b/i.test(normalized)) inferredResolution = "1080p";
+   const resolution = overrides.resolution && overrides.resolution !== "auto" ? overrides.resolution : inferredResolution;
+ 
+   let inferredFps: FrameRate = 24;
+@@ -190,32 +167,23 @@ export function inferPromptSettings(prompt: string, overrides: PromptOverrides =
+   const hasExplicitScenes = /(?:^|\n)\s*(?:#{1,6}\s*)?SCENE\s+\d+/im.test(normalized);
+   const clipLimit = maxSingleClipSeconds(renderMode, resolution, fps);
+   const mode: "DIRECT" | "SCENES" = hasExplicitScenes || durationSeconds > clipLimit || (videoType === "story" && durationSeconds > 10) ? "SCENES" : "DIRECT";
+-
+   const quality = overrides.quality && overrides.quality !== "auto" ? overrides.quality : legacyQualityForResolution(resolution);
+ 
+-  return {
+-    mode,
+-    aspectRatio,
+-    quality,
+-    renderMode,
+-    resolution,
+-    fps,
+-    audioQuality,
+-    durationSeconds,
+-    videoType,
+-    nativeAudio,
+-  };
++  return { mode, aspectRatio, quality, renderMode, resolution, fps, audioQuality, durationSeconds, videoType, nativeAudio };
+ }
+ 
+ export function statusLabel(status?: string) {
+   switch (status) {
+-    case "QUEUED": return "Preparing your render";
+-    case "PLANNING": return "Breaking the story into scenes";
+-    case "STOPPING": return "Stopping generation";
++    case "STARTING": return "Submitting your render";
++    case "QUEUED": return "Waiting for the GPU";
++    case "PLANNING": return "Analyzing your brief and planning scenes";
++    case "STOPPING":
++    case "CANCEL_REQUESTED": return "Stopping generation";
+     case "CANCELLED": return "Generation stopped";
+     case "GENERATING": return "Generating video with LTX-2.5";
+     case "STITCHING": return "Joining your scenes";
+-    case "UPLOADING": return "Preparing the final video";
++    case "ANALYZING": return "Inspecting technical video quality";
++    case "UPLOADING": return "Publishing the final video";
+     case "COMPLETED": return "Your video is ready";
+     case "FAILED": return "Generation failed";
+     default: return "Preparing your video";
+@@ -225,6 +193,7 @@ export function statusLabel(status?: string) {
+ export type Generation = Omit<PromptSettings, "videoType" | "quality" | "renderMode" | "resolution" | "fps" | "audioQuality"> & {
+   quality: StoredQuality;
+   id: string;
++  clientRequestId?: string | null;
+   prompt: string;
+   videoType?: VideoType;
+   model?: string;
+@@ -235,8 +204,12 @@ export type Generation = Omit<PromptSettings, "videoType" | "quality" | "renderM
+   error?: string | null;
+   providerJobId?: string | null;
+   outputUrl?: string | null;
++  thumbnailUrl?: string | null;
+   createdAt: string;
+   scenes?: ScenePlanItem[];
++  versions?: VideoVersionState[];
++  analysis?: ProductionBrief | null;
++  qcReport?: QCReport | null;
+   metadata?: {
+     continuityContext?: string | null;
+     videoType?: VideoType | null;
+@@ -256,17 +229,12 @@ export type Turn = {
+   connectionLost?: boolean;
+ };
+ 
+-export type Conversation = {
+-  id: string;
+-  title: string;
+-  createdAt: string;
+-  turns: Turn[];
+-};
++export type Conversation = { id: string; title: string; createdAt: string; turns: Turn[] };
+ 
+ export function conversationTitle(prompt: string) {
+   const clean = prompt.replace(/[*#_`]/g, "").replace(/^(?:please\s+)?(?:create|generate|make)\s+(?:(?:me|a|an)\s+)*/i, "").replace(/\s+/g, " ").trim();
+   const words = clean.split(" ").slice(0, 7).join(" ");
+-  return (words.length > 48 ? `${words.slice(0, 47).trim()}...` : words) || "Untitled video";
++  return (words.length > 42 ? `${words.slice(0, 42).trim()}...` : words) || "Untitled video";
+ }
+ 
+ export function isActive(status: string) {
+@@ -283,7 +251,7 @@ export function turnFromJob(job: Generation): Turn {
+   const renderMode = job.metadata?.renderMode || inferred.renderMode;
+   const resolution = job.metadata?.resolution || inferred.resolution;
+   const fps = job.metadata?.fps || inferred.fps;
+-  const audioQuality = job.metadata?.audioQuality || (job.nativeAudio ? inferred.audioQuality : "off");
++  const audioQuality = job.metadata?.audioQuality || (job.nativeAudio ? "standard" : "off");
+   const settings: PromptSettings = {
+     mode: job.mode,
+     aspectRatio: job.aspectRatio,
+diff --git a/triven-patch-new/components/cinema/director-panel.tsx b/components/cinema/director-panel.tsx
+new file mode 100644
+index 0000000..c7a1bec
+--- /dev/null
++++ b/components/cinema/director-panel.tsx
+@@ -0,0 +1,31 @@
++"use client";
++
++import type { ProductionBrief, ScenePlanItem } from "@/lib/types";
++
++export function DirectorPanel({ analysis, scenes }: { analysis?: ProductionBrief | null; scenes?: ScenePlanItem[] }) {
++  if (!analysis && !scenes?.length) return null;
++  return <details className="directorPanel">
++    <summary><span>AI Director plan</span><small>{scenes?.length ? `${scenes.length} shot${scenes.length === 1 ? "" : "s"}` : "production brief"}</small></summary>
++    <div className="directorBody">
++      {analysis && <>
++        <div className="directorGrid">
++          <div><span>Intent</span><p>{analysis.intent}</p></div>
++          <div><span>Visual language</span><p>{analysis.visualStyle}</p></div>
++          <div><span>Camera</span><p>{analysis.cameraLanguage}</p></div>
++          <div><span>Audio</span><p>{analysis.audioDirection}</p></div>
++        </div>
++        {(analysis.characters.length > 0 || analysis.locations.length > 0) && <div className="directorFacts">
++          {analysis.characters.length > 0 && <div><strong>Characters</strong><span>{analysis.characters.join(" · ")}</span></div>}
++          {analysis.locations.length > 0 && <div><strong>Locations</strong><span>{analysis.locations.join(" · ")}</span></div>}
++        </div>}
++        {analysis.warnings.length > 0 && <div className="directorWarnings"><strong>Production notes</strong>{analysis.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
++      </>}
++      {scenes?.length ? <div className="shotList">
++        {scenes.map((scene) => <div className="shotCard" key={`${scene.order}-${scene.title}`}>
++          <div className="shotIndex">{String(scene.order).padStart(2, "0")}</div>
++          <div><strong>{scene.title}</strong><small>{scene.duration}s</small><p>{scene.prompt}</p></div>
++        </div>)}
++      </div> : null}
++    </div>
++  </details>;
++}
+diff --git a/components/cinema/generation-message.tsx b/components/cinema/generation-message.tsx
+index 78ff6e1..ea68819 100644
+--- a/components/cinema/generation-message.tsx
++++ b/components/cinema/generation-message.tsx
+@@ -10,7 +10,9 @@ import {
+   videoTypeLabel,
+   type Turn,
+ } from "./chat-model";
++import { DirectorPanel } from "./director-panel";
+ import { Icon } from "./icons";
++import { VideoEditor } from "./video-editor";
+ 
+ export function GenerationMessage({ turn, busy, onRegenerate, onEdit }: { turn: Turn; busy: boolean; onRegenerate: () => void; onEdit: () => void }) {
+   const [downloading, setDownloading] = useState(false);
+@@ -20,18 +22,21 @@ export function GenerationMessage({ turn, busy, onRegenerate, onEdit }: { turn:
+   const loading = isActive(turn.status);
+   const cancelled = turn.status === "CANCELLED" || (turn.status === "FAILED" && job?.statusMessage === "Generation stopped by user");
+   const failed = turn.status === "FAILED" && !cancelled;
+-  const outputUrl = job?.outputUrl;
++  const outputUrl = job?.outputUrl || "";
++  const [previewUrl, setPreviewUrl] = useState(outputUrl);
+   const aspectRatio = job?.aspectRatio || turn.settings.aspectRatio;
+   const progress = Math.max(0, Math.min(100, Math.round(job?.progress ?? 0)));
+   const videoType = turn.settings.videoType;
+   const resolution = outputResolution(aspectRatio, turn.settings.resolution);
+ 
++
+   async function download() {
+-    if (!outputUrl || downloading) return;
++    const source = previewUrl || outputUrl;
++    if (!source || downloading) return;
+     setDownloading(true);
+     setDownloadError(false);
+     try {
+-      const response = await fetch(outputUrl);
++      const response = await fetch(source);
+       if (!response.ok) throw new Error("download");
+       const blob = await response.blob();
+       const url = URL.createObjectURL(blob);
+@@ -61,27 +66,46 @@ export function GenerationMessage({ turn, busy, onRegenerate, onEdit }: { turn:
+         <span>{turn.settings.fps} FPS</span>
+         <span>{audioQualityLabel(turn.settings.audioQuality)}</span>
+       </div>
++
++      {job && <DirectorPanel analysis={job.analysis} scenes={job.scenes} />}
++
+       {loading && <>
+         <div className={`videoPlaceholder ratio-${aspectRatio.replace(":", "-")}`} aria-hidden="true"><div className="frameCorners" /><div className="placeholderCenter"><span className="renderMark">T</span><span>CREATING YOUR VIDEO</span><div className="renderDots"><i /><i /><i /></div></div></div>
+-        <div className="renderStatus"><span className="statusSpinner" /><span>{turn.connectionLost ? "Connection interrupted. Reconnecting..." : turn.status === "PLANNING" ? "Preparing scenes from your prompt" : turn.status === "STARTING" ? "Submitting your render" : turn.status === "QUEUED" ? "Waiting for the GPU" : turn.status === "STITCHING" ? "Joining your scenes" : turn.status === "UPLOADING" ? "Preparing the final video" : `${renderModeLabel(turn.settings.renderMode)} mode is rendering at ${turn.settings.fps} FPS`}</span></div>
++        <div className="renderStatus"><span className="statusSpinner" /><span>{turn.connectionLost ? "Connection interrupted. Reconnecting..." : job?.statusMessage || statusLabel(turn.status)}</span></div>
+         {job && <div className="generationProgress">
+           <div className="generationProgressInfo"><span>Video generation progress</span><strong>{progress}%</strong></div>
+           <div className="generationProgressTrack" role="progressbar" aria-label="Video generation progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
+             <div className="generationProgressFill" style={{ width: `${progress}%` }} />
+           </div>
+         </div>}
+-        <p className="responseNote">High resolution, Pro mode and high FPS can take significantly longer. You can explore your other chats.</p>
++        <p className="responseNote">Triven plans the shots first, renders on LTX-2.5, then runs automated technical QC before publishing the master.</p>
+       </>}
++
+       {cancelled && <div className="failureCard stoppedCard"><p>This render was stopped. Edit the prompt and generate a new version, or regenerate with the same settings.</p><div className="resultActions"><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Regenerate</button></div></div>}
+-      {failed && <div className="failureCard"><p>The video couldn&apos;t be completed. Try again, or adjust your prompt below.</p><div className="resultActions"><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Try again</button></div></div>}
++      {failed && <div className="failureCard"><p>The video couldn&apos;t be completed. {job?.error ? job.error : "Try again, or adjust your prompt below."}</p><div className="resultActions"><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Try again</button></div></div>}
++
+       {!loading && !failed && outputUrl && <>
+-        <div className={`videoFrame ratio-${aspectRatio.replace(":", "-")}`}><video key={outputUrl} src={outputUrl} controls playsInline preload="metadata" onError={() => setPlaybackError(true)} /></div>
+-        {playbackError && <p className="responseNote">The video couldn&apos;t load. <a href={outputUrl} target="_blank" rel="noopener noreferrer">Open video directly</a></p>}
++        <div className={`videoFrame ratio-${aspectRatio.replace(":", "-")}`}><video key={previewUrl || outputUrl} src={previewUrl || outputUrl} poster={job?.thumbnailUrl || undefined} controls playsInline preload="metadata" onError={() => setPlaybackError(true)} /></div>
++        {playbackError && <p className="responseNote">The video couldn&apos;t load. <a href={previewUrl || outputUrl} target="_blank" rel="noopener noreferrer">Open video directly</a></p>}
++
++        {job?.qcReport && <div className="qcCard">
++          <div className="qcScore"><span>Technical QC</span><strong>{job.qcReport.technicalScore}/100</strong></div>
++          <div className="qcFacts">
++            {job.qcReport.width && job.qcReport.height && <span>{job.qcReport.width}×{job.qcReport.height}</span>}
++            {job.qcReport.fps && <span>{job.qcReport.fps} FPS</span>}
++            {job.qcReport.videoCodec && <span>{job.qcReport.videoCodec.toUpperCase()}</span>}
++            {job.qcReport.audioCodec && <span>{job.qcReport.audioCodec.toUpperCase()}</span>}
++          </div>
++          {job.qcReport.issues?.slice(0, 3).map((issue) => <p key={`${issue.code}-${issue.message}`} className={`qcIssue ${issue.severity}`}>{issue.message}</p>)}
++        </div>}
++
+         <div className="resultMeta">
+           {videoTypeLabel(videoType)}<span>-</span>{job.durationSeconds} sec<span>-</span>{job.aspectRatio}<span>-</span>{renderModeLabel(turn.settings.renderMode)}<span>-</span>{resolution}<span>-</span>{turn.settings.fps} FPS<span>-</span>{audioQualityLabel(turn.settings.audioQuality)}{job.model && <><span>-</span>{job.model.toUpperCase()}</>}
+         </div>
+-        <div className="resultActions"><button className="textAction" onClick={download} disabled={downloading}><Icon name="download" size={16} />{downloading ? "Downloading..." : "Download"}</button><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Regenerate</button></div>
+-        {downloadError && <p className="responseNote" role="status">Direct download isn&apos;t available from this host. <a href={outputUrl} target="_blank" rel="noopener noreferrer">Open the video to save it</a>.</p>}
++        <div className="resultActions"><button className="textAction" onClick={download} disabled={downloading}><Icon name="download" size={16} />{downloading ? "Downloading..." : "Download current"}</button><button className="textAction" disabled={busy} onClick={onEdit}><Icon name="edit" size={16} />Edit prompt</button><button className="textAction" disabled={busy} onClick={onRegenerate}><Icon name="retry" size={16} />Regenerate</button></div>
++
++        <VideoEditor generationId={job.id} originalUrl={outputUrl} durationSeconds={job.durationSeconds} initialVersions={job.versions || []} onPreviewChange={(url) => { setPlaybackError(false); setPreviewUrl(url); }} />
++        {downloadError && <p className="responseNote" role="status">Direct download isn&apos;t available from this host. <a href={previewUrl || outputUrl} target="_blank" rel="noopener noreferrer">Open the video to save it</a>.</p>}
+       </>}
+       {!loading && !failed && !cancelled && !outputUrl && <p className="responseNote">The render finished, but its video link is unavailable.</p>}
+     </div>
+diff --git a/components/cinema/prompt-composer.tsx b/components/cinema/prompt-composer.tsx
+index 4f679c2..a18eee0 100644
+--- a/components/cinema/prompt-composer.tsx
++++ b/components/cinema/prompt-composer.tsx
+@@ -18,7 +18,7 @@ type RenderModeSelection = RenderMode | "auto";
+ type ResolutionSelection = Resolution | "auto";
+ type FpsSelection = FrameRate | "auto";
+ type AudioSelection = AudioQuality | "auto";
+-type DurationSelection = 5 | 10 | 15 | 30 | 60 | "auto";
++type DurationSelection = 5 | 10 | 15 | 30 | 60 | 90 | 120 | 180 | "auto";
+ 
+ export type ComposerEditDraft = {
+   id: string;
+@@ -62,7 +62,7 @@ export function PromptComposer({
+     durationSeconds: duration,
+     audioQuality,
+   });
+-  const canSubmit = ready && !busy && prompt.trim().length >= 5 && prompt.trim().length <= 8000;
++  const canSubmit = ready && !busy && prompt.trim().length >= 5 && prompt.trim().length <= 12000;
+   const hasPrompt = prompt.trim().length >= 5;
+ 
+   useEffect(() => {
+@@ -82,7 +82,7 @@ export function PromptComposer({
+       setRenderMode(editDraft.settings.renderMode);
+       setResolution(editDraft.settings.resolution);
+       setFps(editDraft.settings.fps);
+-      setDuration([5, 10, 15, 30, 60].includes(editDraft.settings.durationSeconds) ? editDraft.settings.durationSeconds as DurationSelection : "auto");
++      setDuration([5, 10, 15, 30, 60, 90, 120, 180].includes(editDraft.settings.durationSeconds) ? editDraft.settings.durationSeconds as DurationSelection : "auto");
+       setAudioQuality(editDraft.settings.audioQuality);
+       onEditDraftApplied?.();
+ 
+@@ -109,7 +109,7 @@ export function PromptComposer({
+           ref={textarea}
+           aria-label="Describe your video"
+           value={prompt}
+-          maxLength={8000}
++          maxLength={12000}
+           rows={2}
+           placeholder={chatMode ? "Describe the next video you want to create..." : "Describe a scene, story, ad or idea..."}
+           onChange={(event) => setPrompt(event.target.value)}
+@@ -193,7 +193,7 @@ export function PromptComposer({
+             <option value="auto">Auto</option>
+             <option value="24">24 FPS</option>
+             <option value="25">25 FPS</option>
+-            <option value="30">30 FPS</option>
++            <option value="30">30 FPS (experimental)</option>
+             <option value="48">48 FPS</option>
+             <option value="50">50 FPS</option>
+           </select>
+@@ -212,6 +212,9 @@ export function PromptComposer({
+             <option value="15">15 sec</option>
+             <option value="30">30 sec</option>
+             <option value="60">60 sec</option>
++            <option value="90">90 sec</option>
++            <option value="120">2 min</option>
++            <option value="180">3 min</option>
+           </select>
+         </label>
+ 
+diff --git a/components/cinema/use-conversations.ts b/components/cinema/use-conversations.ts
+index c53c35c..0fbbfc9 100644
+--- a/components/cinema/use-conversations.ts
++++ b/components/cinema/use-conversations.ts
+@@ -178,8 +178,8 @@ export function useConversations() {
+       const response = await fetch(`/api/generations/${encodeURIComponent(turn.job.id)}/cancel`, { method: "POST" });
+       const job: Generation = await response.json();
+       if (!response.ok) throw new Error("cancel");
+-      updateTurn(chatId, turnId, { job, status: "CANCELLED", connectionLost: false });
+-      setNotice("");
++      updateTurn(chatId, turnId, { job, status: turnStatusFromJob(job), connectionLost: false });
++      setNotice(job.status === "CANCEL_REQUESTED" ? "Stop requested. The worker will exit at the next safe checkpoint." : "");
+       return true;
+     } catch {
+       updateTurn(chatId, turnId, { status: turn.status });
+@@ -190,7 +190,7 @@ export function useConversations() {
+ 
+   function submit(rawPrompt: string, original?: Turn, explicitSettings?: Turn["settings"]): boolean {
+     const prompt = rawPrompt.trim();
+-    if (!ready || prompt.length < 5 || prompt.length > 8000) return false;
++    if (!ready || prompt.length < 5 || prompt.length > 12000) return false;
+     const chatId = activeId || crypto.randomUUID();
+     if (submitting.current.has(chatId) || conversations.find((chat) => chat.id === chatId)?.turns.some((turn) => isActive(turn.status))) return false;
+     submitting.current.add(chatId);
+@@ -219,12 +219,16 @@ export function useConversations() {
+         updateTurn(chatId, turn.id, { status: "STARTING" });
+         const response = await fetch("/api/generations", {
+           method: "POST", headers: { "content-type": "application/json" }, signal: controller.signal,
+-          body: JSON.stringify({ prompt, mode: settings.mode, videoType: settings.videoType, aspectRatio: settings.aspectRatio, quality: settings.quality, renderMode: settings.renderMode, resolution: settings.resolution, fps: settings.fps, audioQuality: settings.audioQuality, durationSeconds: settings.durationSeconds, model: "ltx-2.5", nativeAudio: original?.job?.nativeAudio ?? settings.nativeAudio, enhancePrompt: original?.job?.enhancePrompt ?? false, seed: Math.floor(Math.random() * 2_147_483_647), continuityContext, scenes }),
++          body: JSON.stringify({ clientRequestId: turn.id, prompt, mode: settings.mode, videoType: settings.videoType, aspectRatio: settings.aspectRatio, quality: settings.quality, renderMode: settings.renderMode, resolution: settings.resolution, fps: settings.fps, audioQuality: settings.audioQuality, durationSeconds: settings.durationSeconds, model: "ltx-2.5", nativeAudio: original?.job?.nativeAudio ?? settings.nativeAudio, enhancePrompt: original?.job?.enhancePrompt ?? false, seed: Math.floor(Math.random() * 2_147_483_647), continuityContext, scenes }),
+         });
+-        const job: Generation = await response.json();
++        const payload = await response.json();
++        const job = payload as Generation;
+         // The API can return a persisted failed job with HTTP 502; retain its ID.
+-        if (job.id && job.status) updateTurn(chatId, turn.id, { job, status: job.status });
+-        else throw new Error("submission");
++        if (job.id && job.status) updateTurn(chatId, turn.id, { job, status: turnStatusFromJob(job) });
++        else {
++          if (typeof payload?.error === "string") setNotice(payload.error);
++          throw new Error("submission");
++        }
+       } catch {
+         if (!controller.signal.aborted) updateTurn(chatId, turn.id, { status: "FAILED" });
+       } finally {
+diff --git a/triven-patch-new/components/cinema/video-editor.tsx b/components/cinema/video-editor.tsx
+new file mode 100644
+index 0000000..b709c6c
+--- /dev/null
++++ b/components/cinema/video-editor.tsx
+@@ -0,0 +1,176 @@
++"use client";
++
++import { useCallback, useEffect, useState } from "react";
++import type { VideoEditOperations, VideoVersionState } from "@/lib/types";
++
++const DEFAULTS: VideoEditOperations = {
++  preset: "custom",
++  trimStart: 0,
++  trimEnd: null,
++  speed: 1,
++  volume: 1,
++  mute: false,
++  fadeIn: 0,
++  fadeOut: 0,
++  brightness: 0,
++  contrast: 1,
++  saturation: 1,
++  sharpen: 0,
++  blur: 0,
++  vignette: false,
++  normalizeAudio: false,
++  crop: "original",
++  rotate: 0,
++  mirror: false,
++};
++
++function replaceVersion(items: VideoVersionState[], next: VideoVersionState) {
++  return [next, ...items.filter((item) => item.id !== next.id)];
++}
++
++export function VideoEditor({
++  generationId,
++  originalUrl,
++  durationSeconds,
++  initialVersions = [],
++  onPreviewChange,
++}: {
++  generationId: string;
++  originalUrl: string;
++  durationSeconds: number;
++  initialVersions?: VideoVersionState[];
++  onPreviewChange: (url: string) => void;
++}) {
++  const [open, setOpen] = useState(false);
++  const [operations, setOperations] = useState<VideoEditOperations>(DEFAULTS);
++  const [versions, setVersions] = useState<VideoVersionState[]>(initialVersions);
++  const [processingId, setProcessingId] = useState<string | null>(null);
++  const [error, setError] = useState("");
++
++  const refreshVersions = useCallback(async () => {
++    try {
++      const response = await fetch(`/api/generations/${encodeURIComponent(generationId)}/edits`, { cache: "no-store" });
++      if (!response.ok) return;
++      const rows: VideoVersionState[] = await response.json();
++      setVersions(rows);
++    } catch { /* keep current list */ }
++  }, [generationId]);
++
++  useEffect(() => {
++    if (open) void refreshVersions();
++  }, [open, refreshVersions]);
++
++  useEffect(() => {
++    if (!processingId) return;
++    let cancelled = false;
++    const timer = window.setInterval(async () => {
++      try {
++        const response = await fetch(`/api/generations/${encodeURIComponent(generationId)}/edits/${encodeURIComponent(processingId)}`, { cache: "no-store" });
++        if (!response.ok) return;
++        const version: VideoVersionState = await response.json();
++        if (cancelled) return;
++        setVersions((items) => replaceVersion(items, version));
++        if (version.status === "COMPLETED") {
++          setProcessingId(null);
++          if (version.outputUrl) onPreviewChange(version.outputUrl);
++        } else if (version.status === "FAILED") {
++          setProcessingId(null);
++          setError(version.error || "The edit could not be completed.");
++        }
++      } catch { /* retry on next interval */ }
++    }, 1800);
++    return () => { cancelled = true; window.clearInterval(timer); };
++  }, [generationId, onPreviewChange, processingId]);
++
++  async function deleteVersion(versionId: string) {
++    if (processingId === versionId) return;
++    setError("");
++    try {
++      const response = await fetch(`/api/generations/${encodeURIComponent(generationId)}/edits/${encodeURIComponent(versionId)}`, { method: "DELETE" });
++      const payload = await response.json();
++      if (!response.ok) throw new Error(payload?.error || "Could not delete edit version");
++      setVersions((items) => items.filter((item) => item.id !== versionId));
++      onPreviewChange(originalUrl);
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Could not delete edit version");
++    }
++  }
++
++  async function applyEdit() {
++    if (processingId) return;
++    setError("");
++    try {
++      const response = await fetch(`/api/generations/${encodeURIComponent(generationId)}/edits`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({ label: `${operations.preset === "custom" ? "Custom" : operations.preset} edit`, operations }),
++      });
++      const version: VideoVersionState & { error?: string } = await response.json();
++      if (!response.ok || !version.id) throw new Error(version.error || "Could not start edit");
++      setVersions((items) => replaceVersion(items, version));
++      if (version.status === "COMPLETED" && version.outputUrl) onPreviewChange(version.outputUrl);
++      else setProcessingId(version.id);
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Could not start edit");
++    }
++  }
++
++  const set = <K extends keyof VideoEditOperations,>(key: K, value: VideoEditOperations[K]) => setOperations((current) => ({ ...current, [key]: value }));
++
++  return <div className={`videoEditor ${open ? "open" : ""}`}>
++    <button className="editorToggle" type="button" onClick={() => setOpen((value) => !value)}>
++      <span>Video editor</span><small>Trim · speed · color · audio · crop · finishing</small>
++    </button>
++    {open && <div className="editorBody">
++      <div className="editorToolbar">
++        <label><span>Preset</span><select value={operations.preset} onChange={(event) => set("preset", event.target.value as VideoEditOperations["preset"])}>
++          <option value="custom">Custom</option><option value="cinematic">Cinematic</option><option value="vivid">Vivid</option><option value="social">Social punch</option><option value="clean">Clean</option>
++        </select></label>
++        <label><span>Crop</span><select value={operations.crop} onChange={(event) => set("crop", event.target.value as VideoEditOperations["crop"])}>
++          <option value="original">Original</option><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option>
++        </select></label>
++        <label><span>Rotate</span><select value={operations.rotate} onChange={(event) => set("rotate", Number(event.target.value) as VideoEditOperations["rotate"])}>
++          <option value={0}>0°</option><option value={90}>90°</option><option value={180}>180°</option><option value={270}>270°</option>
++        </select></label>
++      </div>
++
++      <div className="editorGrid">
++        <label><span>Trim start</span><input type="number" min={0} max={durationSeconds} step="0.1" value={operations.trimStart} onChange={(event) => set("trimStart", Number(event.target.value))} /><small>seconds</small></label>
++        <label><span>Trim end</span><input type="number" min={0} max={durationSeconds} step="0.1" placeholder={`${durationSeconds}`} value={operations.trimEnd ?? ""} onChange={(event) => set("trimEnd", event.target.value === "" ? null : Number(event.target.value))} /><small>seconds</small></label>
++        <label><span>Speed</span><input type="range" min="0.25" max="4" step="0.05" value={operations.speed} onChange={(event) => set("speed", Number(event.target.value))} /><strong>{operations.speed.toFixed(2)}×</strong></label>
++        <label><span>Volume</span><input type="range" min="0" max="2" step="0.05" value={operations.volume} disabled={operations.mute} onChange={(event) => set("volume", Number(event.target.value))} /><strong>{operations.mute ? "Muted" : `${Math.round(operations.volume * 100)}%`}</strong></label>
++        <label><span>Fade in</span><input type="range" min="0" max="5" step="0.1" value={operations.fadeIn} onChange={(event) => set("fadeIn", Number(event.target.value))} /><strong>{operations.fadeIn.toFixed(1)}s</strong></label>
++        <label><span>Fade out</span><input type="range" min="0" max="5" step="0.1" value={operations.fadeOut} onChange={(event) => set("fadeOut", Number(event.target.value))} /><strong>{operations.fadeOut.toFixed(1)}s</strong></label>
++        <label><span>Brightness</span><input type="range" min="-0.3" max="0.3" step="0.01" value={operations.brightness} onChange={(event) => set("brightness", Number(event.target.value))} /><strong>{operations.brightness.toFixed(2)}</strong></label>
++        <label><span>Contrast</span><input type="range" min="0.6" max="1.6" step="0.02" value={operations.contrast} onChange={(event) => set("contrast", Number(event.target.value))} /><strong>{operations.contrast.toFixed(2)}</strong></label>
++        <label><span>Saturation</span><input type="range" min="0" max="2" step="0.02" value={operations.saturation} onChange={(event) => set("saturation", Number(event.target.value))} /><strong>{operations.saturation.toFixed(2)}</strong></label>
++        <label><span>Sharpen</span><input type="range" min="0" max="2" step="0.05" value={operations.sharpen} onChange={(event) => set("sharpen", Number(event.target.value))} /><strong>{operations.sharpen.toFixed(2)}</strong></label>
++        <label><span>Blur</span><input type="range" min="0" max="12" step="1" value={operations.blur} onChange={(event) => set("blur", Number(event.target.value))} /><strong>{operations.blur.toFixed(0)}</strong></label>
++      </div>
++
++      <div className="editorChecks">
++        <label><input type="checkbox" checked={operations.mute} onChange={(event) => set("mute", event.target.checked)} />Mute audio</label>
++        <label><input type="checkbox" checked={operations.normalizeAudio} disabled={operations.mute} onChange={(event) => set("normalizeAudio", event.target.checked)} />Normalize loudness</label>
++        <label><input type="checkbox" checked={operations.mirror} onChange={(event) => set("mirror", event.target.checked)} />Mirror horizontally</label>
++        <label><input type="checkbox" checked={operations.vignette} onChange={(event) => set("vignette", event.target.checked)} />Cinematic vignette</label>
++      </div>
++
++      <div className="editorActions">
++        <button type="button" className="secondaryEditButton" onClick={() => { setOperations(DEFAULTS); onPreviewChange(originalUrl); }}>Reset controls</button>
++        <button type="button" className="primaryEditButton" onClick={applyEdit} disabled={Boolean(processingId)}>{processingId ? "Rendering edit..." : "Apply edit"}</button>
++      </div>
++      {error && <p className="editorError">{error}</p>}
++
++      {(versions.length > 0 || originalUrl) && <div className="versionStrip">
++        <strong>Versions</strong>
++        <button type="button" onClick={() => onPreviewChange(originalUrl)}>Original</button>
++        {versions.map((version, index) => <span className="versionPill" key={version.id}>
++          <button type="button" disabled={!version.outputUrl} onClick={() => version.outputUrl && onPreviewChange(version.outputUrl)}>
++            V{versions.length - index} · {version.status === "COMPLETED" ? `QC ${version.qcReport?.technicalScore ?? "-"}` : version.status.toLowerCase()}
++          </button>
++          <button className="versionDelete" type="button" aria-label={`Delete version ${versions.length - index}`} title="Delete edited version" disabled={["QUEUED", "PROCESSING"].includes(version.status)} onClick={() => void deleteVersion(version.id)}>×</button>
++        </span>)}
++      </div>}
++    </div>}
++  </div>;
++}
+diff --git a/lib/modal.ts b/lib/modal.ts
+index 8aeaf5e..56c9712 100644
+--- a/lib/modal.ts
++++ b/lib/modal.ts
+@@ -1,4 +1,14 @@
+-import type { AudioQuality, FrameRate, ModalJobState, RenderMode, Resolution, ScenePlanItem, StoredQuality } from "@/lib/types";
++import type {
++  AudioQuality,
++  FrameRate,
++  ModalEditState,
++  ModalJobState,
++  RenderMode,
++  Resolution,
++  ScenePlanItem,
++  StoredQuality,
++  VideoEditOperations,
++} from "@/lib/types";
+ 
+ type SubmitInput = {
+   jobId: string;
+@@ -16,6 +26,13 @@ type SubmitInput = {
+   scenes?: ScenePlanItem[];
+ };
+ 
++type EditSubmitInput = {
++  generationId: string;
++  versionId: string;
++  sourceUrl?: string | null;
++  operations: VideoEditOperations;
++};
++
+ function config() {
+   const base = process.env.MODAL_API_URL?.replace(/\/$/, "");
+   const secret = process.env.MODAL_WEB_SECRET;
+@@ -55,3 +72,57 @@ export async function cancelModalJob(jobId: string): Promise<ModalJobState> {
+   if (!response.ok) throw new Error(`Modal cancel failed (${response.status}): ${await response.text()}`);
+   return response.json();
+ }
++
++export async function submitModalEdit(input: EditSubmitInput): Promise<{ callId: string }> {
++  const { base, secret } = config();
++  const response = await fetch(`${base}/edit/submit`, {
++    method: "POST",
++    headers: { "content-type": "application/json", "x-triven-secret": secret },
++    body: JSON.stringify(input),
++    cache: "no-store",
++  });
++  if (!response.ok) throw new Error(`Modal edit submit failed (${response.status}): ${await response.text()}`);
++  return response.json();
++}
++
++export async function getModalEdit(versionId: string): Promise<ModalEditState> {
++  const { base, secret } = config();
++  const response = await fetch(`${base}/edit/status/${encodeURIComponent(versionId)}`, {
++    headers: { "x-triven-secret": secret },
++    cache: "no-store",
++  });
++  if (!response.ok) throw new Error(`Modal edit status failed (${response.status}): ${await response.text()}`);
++  return response.json();
++}
++
++export async function getModalHealth(): Promise<Record<string, unknown>> {
++  const { base } = config();
++  const response = await fetch(`${base}/health`, {
++    cache: "no-store",
++    signal: AbortSignal.timeout(8000),
++  });
++  if (!response.ok) throw new Error(`Modal health failed (${response.status}): ${await response.text()}`);
++  return response.json();
++}
++
++export async function deleteModalGeneration(jobId: string): Promise<{ ok: boolean; jobId: string }> {
++  const { base, secret } = config();
++  const response = await fetch(`${base}/delete/${encodeURIComponent(jobId)}`, {
++    method: "DELETE",
++    headers: { "x-triven-secret": secret },
++    cache: "no-store",
++  });
++  if (!response.ok) throw new Error(`Modal delete failed (${response.status}): ${await response.text()}`);
++  return response.json();
++}
++
++export async function deleteModalEditVersion(generationId: string, versionId: string): Promise<{ ok: boolean }> {
++  const { base, secret } = config();
++  const response = await fetch(`${base}/edit/delete/${encodeURIComponent(generationId)}/${encodeURIComponent(versionId)}`, {
++    method: "DELETE",
++    headers: { "x-triven-secret": secret },
++    cache: "no-store",
++  });
++  if (!response.ok) throw new Error(`Modal edit delete failed (${response.status}): ${await response.text()}`);
++  return response.json();
++}
+diff --git a/lib/scene-planner.ts b/lib/scene-planner.ts
+index 24c8bbc..42ea3aa 100644
+--- a/lib/scene-planner.ts
++++ b/lib/scene-planner.ts
+@@ -1,126 +1,297 @@
+-import type { ScenePlan, ScenePlanItem } from "@/lib/types";
++import type { ProductionBrief, ScenePlan, ScenePlanItem } from "@/lib/types";
+ 
+-const MAX_SCENES = 12;
+-const MAX_SCENE_SECONDS = 15;
++const MAX_SCENES = 30;
++const MAX_SCENE_SECONDS = 20;
+ 
+ function normalizeWhitespace(value: string): string {
+   return value
+     .replace(/\\\s*\n/g, "\n")
+     .replace(/\r/g, "")
+     .replace(/[ \t]+/g, " ")
++    .replace(/\n[ \t]+/g, "\n")
+     .replace(/\n{3,}/g, "\n\n")
+     .trim();
+ }
+ 
+-function extractSection(prompt: string, heading: string, nextHeadings: string[]): string {
++function oneLine(value: string): string {
++  return normalizeWhitespace(value).replace(/\n+/g, " ").trim();
++}
++
++function unique(items: string[]) {
++  return [...new Set(items.map((item) => oneLine(item)).filter(Boolean))];
++}
++
++function extractSection(prompt: string, heading: string, nextHeadings: string[] = []): string {
+   const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+-  const next = nextHeadings
+-    .map((item) => item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+-    .join("|");
++  const next = nextHeadings.length
++    ? nextHeadings.map((item) => item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")
++    : "SCENE\\s+\\d+";
+   const pattern = new RegExp(
+-    `(?:^|\\n)#{0,4}\\s*${escaped}\\s*\\n([\\s\\S]*?)(?=\\n#{0,4}\\s*(?:${next})\\s*\\n|\\n#{0,4}\\s*SCENE\\s+\\d+|$)`,
++    `(?:^|\\n)#{0,4}\\s*${escaped}\\s*:?\\s*\\n([\\s\\S]*?)(?=\\n#{0,4}\\s*(?:${next})\\s*:?\\s*\\n|\\n#{0,4}\\s*SCENE\\s+\\d+|$)`,
+     "i",
+   );
+   return normalizeWhitespace(prompt.match(pattern)?.[1] || "");
+ }
+ 
++function extractInline(prompt: string, labels: string[]): string {
++  for (const label of labels) {
++    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
++    const match = prompt.match(new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s*)?${escaped}\\s*:\\s*([^\\n]+)`, "i"));
++    if (match?.[1]) return oneLine(match[1]);
++  }
++  return "";
++}
++
++function extractBullets(section: string): string[] {
++  if (!section) return [];
++  const lines = section.split("\n").map((line) => line.replace(/^\s*[-*•]\s*/, "").trim()).filter(Boolean);
++  return unique(lines.length > 1 ? lines : section.split(/[.;]\s+/));
++}
++
++function titleFromPrompt(prompt: string): string {
++  const heading = prompt.match(/^\s*#{1,4}\s*([^\n#]{3,100})/m)?.[1];
++  if (heading && !/^scene\s+\d+/i.test(heading)) return oneLine(heading).slice(0, 100);
++  const sentence = oneLine(prompt).replace(/^(?:please\s+)?(?:create|generate|make)\s+(?:(?:me|a|an)\s+)*/i, "");
++  return sentence.split(/[.!?]/)[0].slice(0, 100) || "Untitled video";
++}
++
++function detectIntent(prompt: string): string {
++  const lower = prompt.toLowerCase();
++  if (/product\s+(?:ad|advert|commercial)|brand\s+film|ugc\s+ad/.test(lower)) return "Sell or demonstrate a product with a clear visual benefit and call-to-action.";
++  if (/explainer|tutorial|how\s+to|educational/.test(lower)) return "Explain a concept clearly with visible cause-and-effect and easy-to-follow sequencing.";
++  if (/story|narrative|episode|adventure|character/.test(lower)) return "Tell a coherent visual story with continuity, progression, and an intentional ending.";
++  if (/reel|tiktok|shorts?|social/.test(lower)) return "Create a fast, high-retention social video with an immediate hook and readable visual beats.";
++  return "Create a polished cinematic video that follows the requested subject, action, style, and pacing.";
++}
++
+ function continuityFromPrompt(prompt: string): string {
+-  const visual = extractSection(prompt, "Visual Style", ["Main Character", "Setting", "Audio", "Camera & Animation", "Important Generation Rules"]);
+-  const character = extractSection(prompt, "Main Character", ["Setting", "Audio", "Camera & Animation", "Important Generation Rules"]);
+-  const setting = extractSection(prompt, "Setting", ["Audio", "Camera & Animation", "Important Generation Rules"]);
+-  const rules = extractSection(prompt, "Important Generation Rules", ["Audio", "Camera & Animation"]);
++  const visual = extractSection(prompt, "Visual Style", ["Main Character", "Characters", "Setting", "Audio", "Camera & Animation", "Camera", "Important Generation Rules", "Rules"]);
++  const mainCharacter = extractSection(prompt, "Main Character", ["Characters", "Setting", "Audio", "Camera & Animation", "Camera", "Important Generation Rules", "Rules"]);
++  const supportingCharacters = extractSection(prompt, "Characters", ["Setting", "Audio", "Camera & Animation", "Camera", "Important Generation Rules", "Rules"]);
++  const character = [mainCharacter, supportingCharacters].filter(Boolean).join(" ");
++  const setting = extractSection(prompt, "Setting", ["Audio", "Camera & Animation", "Camera", "Important Generation Rules", "Rules"]);
++  const rules = extractSection(prompt, "Important Generation Rules", ["Audio", "Camera & Animation", "Camera"])
++    || extractSection(prompt, "Rules", ["Audio", "Camera & Animation", "Camera"]);
+ 
+   const selectedRules = rules
+     .split("\n")
+-    .filter((line) => /consistent|appearance|environment|flicker|distort|character|background|transition/i.test(line))
++    .filter((line) => /consistent|appearance|environment|flicker|distort|character|background|transition|same|identical|continuity/i.test(line))
+     .join(" ");
+ 
+   const pieces = [visual, character, setting, selectedRules].filter(Boolean);
+   if (pieces.length) {
+-    return normalizeWhitespace(
+-      `CONTINUITY LOCK. Preserve these details exactly across every scene: ${pieces.join(" ")}`,
+-    ).slice(0, 3900);
++    return oneLine(`CONTINUITY LOCK. Preserve these details exactly across every connected shot: ${pieces.join(" ")}`).slice(0, 5600);
+   }
+ 
+-  return "CONTINUITY LOCK. Keep recurring characters identical in face, body proportions, colors, clothing, accessories, voice, and art style. Keep recurring environments, lighting language, palette, and camera style consistent across connected scenes.";
++  return "CONTINUITY LOCK. Keep recurring characters identical in face, body proportions, age, colors, clothing, accessories, voice, and art style. Keep recurring environments, lighting language, palette, lens language, and camera direction consistent across connected shots.";
+ }
+ 
+-function parseTimedScenes(prompt: string): ScenePlanItem[] {
+-  const normalized = prompt.replace(/\r/g, "");
+-  const sceneHeader = /(?:^|\n)#{0,4}\s*SCENE\s+(\d+)\s*[—–-]\s*(\d+)\s*[—–-]\s*(\d+)\s*seconds?\s*\n/gi;
+-  const matches = [...normalized.matchAll(sceneHeader)];
++function buildProductionBrief(prompt: string): ProductionBrief {
++  const visualStyle = oneLine(
++    extractSection(prompt, "Visual Style", ["Main Character", "Characters", "Setting", "Audio", "Camera & Animation", "Camera", "Important Generation Rules", "Rules"])
++      || extractInline(prompt, ["Style", "Visual style", "Look"])
++      || (/cartoon|animated|animation/i.test(prompt) ? "Stylized animation with coherent character design and polished cinematic lighting." : "Cinematic photoreal visual treatment with controlled lighting, coherent materials, and natural motion."),
++  );
++  const mainCharacterSection = extractSection(prompt, "Main Character", ["Characters", "Setting", "Audio", "Camera & Animation", "Camera", "Important Generation Rules", "Rules"]);
++  const supportingCharacterSection = extractSection(prompt, "Characters", ["Setting", "Audio", "Camera & Animation", "Camera", "Important Generation Rules", "Rules"]);
++  const characterSection = [mainCharacterSection, supportingCharacterSection].filter(Boolean).join("\n")
++    || extractInline(prompt, ["Character", "Characters", "Subject"]);
++  const settingSection = extractSection(prompt, "Setting", ["Audio", "Camera & Animation", "Camera", "Important Generation Rules", "Rules"])
++    || extractInline(prompt, ["Setting", "Location", "Environment"]);
++  const cameraLanguage = oneLine(
++    extractSection(prompt, "Camera & Animation", ["Important Generation Rules", "Rules", "Audio"])
++      || extractSection(prompt, "Camera", ["Important Generation Rules", "Rules", "Audio"])
++      || extractInline(prompt, ["Camera", "Camera movement"])
++      || "Use motivated cinematic framing, stable geometry, clear subject focus, and smooth physically plausible camera movement.",
++  );
++  const audioDirection = oneLine(
++    extractSection(prompt, "Audio", ["Camera & Animation", "Camera", "Important Generation Rules", "Rules"])
++      || extractInline(prompt, ["Audio", "Sound", "Music"])
++      || "Generate synchronized ambience and scene-appropriate sound. Spoken words must be dialogue only, never production instructions.",
++  );
++  const rules = extractSection(prompt, "Important Generation Rules", ["Audio", "Camera & Animation", "Camera"])
++    || extractSection(prompt, "Rules", ["Audio", "Camera & Animation", "Camera"]);
++  const mustHave = extractBullets(rules).filter((item) => !/avoid|do not|don't|never|no\s/i.test(item)).slice(0, 20);
++  const avoid = extractBullets(rules).filter((item) => /avoid|do not|don't|never|no\s/i.test(item)).slice(0, 20);
++  const warnings: string[] = [];
++  if (/exactly\s+\d+|exact\s+count|\b\d+\s+(?:children|people|characters|animals)\b/i.test(prompt)) warnings.push("Exact multi-subject counts can drift in generative video; keep critical counts visible and uncluttered per shot.");
++  if (/dialogue|says?|speaks?|voice/i.test(prompt)) warnings.push("Native LTX dialogue is generative rather than transcript-locked. Use an external TTS/lip-sync pass when exact wording is mandatory.");
++  if (/text|logo|label|sign|caption|typography/i.test(prompt)) warnings.push("Generated typography can be unstable. Add final text, logos, captions, and legal copy in the editing pass rather than inside the generated image when exact spelling matters.");
++  if (/consistent|same character|identical/i.test(prompt)) warnings.push("For strongest identity consistency, use image-conditioned shots or reference-control workflows when available; text-only continuity remains probabilistic.");
++
++  return {
++    title: titleFromPrompt(prompt),
++    intent: detectIntent(prompt),
++    visualStyle,
++    characters: extractBullets(characterSection).slice(0, 20),
++    locations: extractBullets(settingSection).slice(0, 20),
++    cameraLanguage,
++    audioDirection,
++    mustHave,
++    avoid,
++    continuity: continuityFromPrompt(prompt),
++    warnings,
++  };
++}
++
++function parseClock(value: string): number | null {
++  const clean = value.trim();
++  if (/^\d+(?:\.\d+)?$/.test(clean)) return Number(clean);
++  const parts = clean.split(":").map(Number);
++  if (parts.some((part) => !Number.isFinite(part))) return null;
++  if (parts.length === 2) return parts[0] * 60 + parts[1];
++  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
++  return null;
++}
++
++function findLabel(block: string, labels: string[]): string {
++  const escapedLabels = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
++  const re = new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s*)?(?:${escapedLabels})\\s*:\\s*([\\s\\S]*?)(?=\\n\\s*(?:[-*]\\s*)?(?:VISUAL|ACTION|CAMERA|SHOT|AUDIO|SOUND|DIALOGUE|VOICE|TRANSITION|MUST HAVE|MUST-HAVE|TIME|DURATION|NOTES?)\\s*:|$)`, "i");
++  return normalizeWhitespace(block.match(re)?.[1] || "");
++}
+ 
++function parseSceneBlocks(prompt: string): ScenePlanItem[] {
++  const normalized = prompt.replace(/\r/g, "");
++  const header = /(?:^|\n)\s*#{0,4}\s*SCENE\s+(\d+)\s*(?:[—–:-]\s*([^\n]*))?\s*\n/gi;
++  const matches = [...normalized.matchAll(header)];
+   if (!matches.length) return [];
+ 
+   const scenes: ScenePlanItem[] = [];
+   for (let i = 0; i < Math.min(matches.length, MAX_SCENES); i += 1) {
+     const match = matches[i];
+-    const order = Number(match[1]);
+-    const start = Number(match[2]);
+-    const end = Number(match[3]);
++    const order = Number(match[1]) || i + 1;
++    const headerText = oneLine(match[2] || "");
+     const bodyStart = (match.index || 0) + match[0].length;
+     const bodyEnd = i + 1 < matches.length ? (matches[i + 1].index || normalized.length) : normalized.length;
+-    const rawBody = normalized.slice(bodyStart, bodyEnd);
+-    const body = normalizeWhitespace(rawBody.split(/\n#{0,4}\s*(?:Audio|Camera & Animation|Important Generation Rules)\s*\n/i)[0]);
+-    const requestedDuration = Math.max(2, end - start);
+-    const duration = Math.min(MAX_SCENE_SECONDS, requestedDuration);
++    const block = normalized.slice(bodyStart, bodyEnd).trim();
++
++    const timeText = findLabel(block, ["TIME", "TIMECODE"]);
++    const durationText = findLabel(block, ["DURATION", "LENGTH"]);
++    let duration: number | null = null;
++    const range = timeText.match(/([0-9:.]+)\s*[—–-]\s*([0-9:.]+)/);
++    if (range) {
++      const start = parseClock(range[1]);
++      const end = parseClock(range[2]);
++      if (start != null && end != null && end > start) duration = end - start;
++    }
++    if (duration == null && durationText) {
++      const d = durationText.match(/(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)?/i);
++      if (d) duration = Number(d[1]);
++    }
++    if (duration == null) {
++      const oldTimed = headerText.match(/(?:^|\s)(\d+)\s*[—–-]\s*(\d+)\s*seconds?/i);
++      if (oldTimed) duration = Number(oldTimed[2]) - Number(oldTimed[1]);
++    }
++
++    const visual = findLabel(block, ["VISUAL", "VISUALS", "LOOK"]);
++    const action = findLabel(block, ["ACTION", "BEAT", "STORY"]);
++    const camera = findLabel(block, ["CAMERA", "SHOT", "CAMERA & ANIMATION"]);
++    const audio = findLabel(block, ["AUDIO", "SOUND", "SFX", "MUSIC"]);
++    const dialogue = findLabel(block, ["DIALOGUE", "VOICE", "VOICEOVER", "VO"]);
++    const transition = findLabel(block, ["TRANSITION"]);
++    const mustHaveRaw = findLabel(block, ["MUST HAVE", "MUST-HAVE"]);
++
++    const stripped = normalizeWhitespace(block
++      .replace(/(?:^|\n)\s*(?:[-*]\s*)?(?:TIME|TIMECODE|DURATION|LENGTH|VISUALS?|LOOK|ACTION|BEAT|STORY|CAMERA(?:\s*&\s*ANIMATION)?|SHOT|AUDIO|SOUND|SFX|MUSIC|DIALOGUE|VOICEOVER|VOICE|VO|TRANSITION|MUST HAVE|MUST-HAVE|NOTES?)\s*:\s*[^\n]*(?:\n(?!\s*(?:[-*]\s*)?(?:TIME|TIMECODE|DURATION|LENGTH|VISUALS?|LOOK|ACTION|BEAT|STORY|CAMERA(?:\s*&\s*ANIMATION)?|SHOT|AUDIO|SOUND|SFX|MUSIC|DIALOGUE|VOICEOVER|VOICE|VO|TRANSITION|MUST HAVE|MUST-HAVE|NOTES?)\s*:)[^\n]*)*/gi, "\n"));
++
++    const title = headerText
++      .replace(/^\d+\s*[—–-]\s*\d+\s*seconds?\s*/i, "")
++      .replace(/^\d+\s*[—–-]\s*\d+\s*/i, "")
++      .trim() || `Scene ${order}`;
++    const sceneDuration = Math.max(2, Math.min(MAX_SCENE_SECONDS, Math.round(duration || 6)));
++    const visualText = visual || stripped || action || `Show the visual beat described by ${title}.`;
++    const actionText = action || stripped;
++    const promptParts = [
++      `SHOT ${order}: ${title}.`,
++      visualText ? `VISUAL: ${oneLine(visualText)}` : "",
++      actionText && oneLine(actionText) !== oneLine(visualText) ? `ACTION: ${oneLine(actionText)}` : "",
++      camera ? `CAMERA: ${oneLine(camera)}` : "",
++      audio ? `AUDIO: ${oneLine(audio)}` : "",
++      dialogue ? `DIALOGUE: Speak only these story words naturally: ${oneLine(dialogue)}` : "",
++      mustHaveRaw ? `MUST HAVE: ${extractBullets(mustHaveRaw).join("; ")}` : "",
++      "Do not narrate headings, timestamps, camera directions, generation instructions, or continuity rules. Do not show prompt text on screen unless explicitly requested as an on-screen graphic.",
++    ].filter(Boolean);
+ 
+     scenes.push({
+-      order: Number.isFinite(order) ? order : i + 1,
+-      title: `Scene ${Number.isFinite(order) ? order : i + 1}`,
+-      duration,
+-      prompt: body.slice(0, 2450),
++      order,
++      title: title.slice(0, 120),
++      duration: sceneDuration,
++      prompt: oneLine(promptParts.join(" ")).slice(0, 4900),
++      visual: visual || stripped || undefined,
++      action: action || undefined,
++      camera: camera || undefined,
++      audio: audio || undefined,
++      dialogue: dialogue || undefined,
++      transition: transition || undefined,
++      mustHave: extractBullets(mustHaveRaw).slice(0, 20),
+     });
+   }
+-
+   return scenes;
+ }
+ 
++function sentenceBeats(prompt: string): string[] {
++  const withoutGlobal = prompt
++    .replace(/(?:^|\n)#{0,4}\s*(?:Visual Style|Main Character|Characters|Setting|Audio|Camera(?:\s*&\s*Animation)?|Important Generation Rules|Rules)\s*:?[\s\S]*?(?=\n#{0,4}\s*(?:Visual Style|Main Character|Characters|Setting|Audio|Camera(?:\s*&\s*Animation)?|Important Generation Rules|Rules|SCENE\s+\d+)\s*:|$)/gi, " ")
++    .replace(/#{1,6}/g, " ");
++  return unique(withoutGlobal.split(/(?<=[.!?])\s+|\n+/).filter((part) => oneLine(part).length >= 15)).slice(0, 40);
++}
++
+ function deterministicPlan(prompt: string, durationSeconds: number): ScenePlan {
+-  const explicitScenes = parseTimedScenes(prompt);
++  const productionBrief = buildProductionBrief(prompt);
++  const explicitScenes = parseSceneBlocks(prompt);
+   if (explicitScenes.length) {
+     return {
+-      summary: "Parsed the timed scenes directly from the user prompt. No external planning API was used.",
+-      continuityContext: continuityFromPrompt(prompt),
++      summary: `Director parsed ${explicitScenes.length} explicit scene${explicitScenes.length === 1 ? "" : "s"}, isolated visual/action/audio instructions, and built a continuity lock before generation.`,
++      continuityContext: productionBrief.continuity,
++      productionBrief,
+       scenes: explicitScenes,
+     };
+   }
+ 
+   const sceneCount = Math.max(2, Math.min(MAX_SCENES, Math.ceil(durationSeconds / 8)));
+-  const baseDuration = Math.max(2, Math.min(MAX_SCENE_SECONDS, Math.floor(durationSeconds / sceneCount)));
++  const beats = sentenceBeats(prompt);
+   let remaining = durationSeconds;
+-  const phases = [
+-    "Establish the setting and introduce the main subject",
+-    "Show the inciting action clearly",
+-    "Develop the central action with visible cause and effect",
+-    "Move closer to the key story beat",
+-    "Escalate the action with a clear visual change",
+-    "Show the result or transformation",
+-    "Resolve the central action",
+-    "Finish with a memorable cinematic closing shot",
+-    "Add a reaction shot that reinforces the story",
+-    "Show a final environmental or character beat",
+-    "Resolve any remaining visual action",
+-    "End cleanly on the hero moment",
++  const phaseFallback = [
++    "Establish the environment, subject, and visual rules in one clear hero composition.",
++    "Introduce the central action with readable cause and effect.",
++    "Develop the action while preserving character and environment continuity.",
++    "Move closer to the key story beat with a motivated camera change.",
++    "Escalate the action with one visible change, reaction, or reveal.",
++    "Show the result or transformation clearly.",
++    "Resolve the central action without introducing unrelated subjects.",
++    "Finish on a memorable, stable closing image that completes the requested story.",
+   ];
+ 
+   const scenes = Array.from({ length: sceneCount }, (_, i) => {
+     const slotsLeft = sceneCount - i;
+     const duration = i === sceneCount - 1
+       ? Math.max(2, Math.min(MAX_SCENE_SECONDS, remaining))
+-      : Math.max(2, Math.min(MAX_SCENE_SECONDS, Math.round(remaining / slotsLeft) || baseDuration));
++      : Math.max(2, Math.min(MAX_SCENE_SECONDS, Math.round(remaining / slotsLeft)));
+     remaining -= duration;
++    const beat = beats[i] || phaseFallback[Math.min(i, phaseFallback.length - 1)];
++    const promptText = oneLine([
++      `SHOT ${i + 1}: ${beat}`,
++      `VISUAL STYLE: ${productionBrief.visualStyle}`,
++      productionBrief.cameraLanguage ? `CAMERA: ${productionBrief.cameraLanguage}` : "",
++      productionBrief.audioDirection ? `AUDIO: ${productionBrief.audioDirection}` : "",
++      "Keep this shot focused on one readable story beat. Preserve all recurring identities and environment details. Do not narrate production instructions or display prompt labels as text.",
++    ].filter(Boolean).join(" "));
+     return {
+       order: i + 1,
+       title: `Scene ${i + 1}`,
+       duration,
+-      prompt: `${phases[i] || phases[phases.length - 1]}. Story context: ${prompt.slice(0, 1500)}. Use chronological action, physically coherent motion, clear camera direction, consistent character design, and synchronized ambient audio.`.slice(0, 2450),
+-    };
++      prompt: promptText.slice(0, 4900),
++      action: beat,
++      camera: productionBrief.cameraLanguage,
++      audio: productionBrief.audioDirection,
++      mustHave: productionBrief.mustHave,
++    } satisfies ScenePlanItem;
+   });
+ 
+   return {
+-    summary: prompt,
+-    continuityContext: continuityFromPrompt(prompt),
++    summary: `Director converted the request into ${sceneCount} chronological shots with a shared continuity bible and scene-specific instructions.`,
++    continuityContext: productionBrief.continuity,
++    productionBrief,
+     scenes,
+   };
+ }
+@@ -128,18 +299,20 @@ function deterministicPlan(prompt: string, durationSeconds: number): ScenePlan {
+ export async function planScenes(
+   prompt: string,
+   durationSeconds: number,
+-  _aspectRatio: string
++  _aspectRatio: string,
+ ): Promise<ScenePlan> {
+   void _aspectRatio;
+-
+   return deterministicPlan(prompt, durationSeconds);
+ }
+ 
++export function analyzeVideoPrompt(prompt: string): ProductionBrief {
++  return buildProductionBrief(prompt);
++}
++
+ export async function enhanceVideoPrompt(prompt: string, continuityContext?: string): Promise<string> {
+   const clean = normalizeWhitespace(prompt);
+-  // Long structured prompts are already detailed. Do not rewrite or expand them.
+-  if (clean.length > 700 || /SCENE\s+\d+/i.test(clean)) return clean;
+-  return normalizeWhitespace(
+-    `${continuityContext ? `${continuityContext} ` : ""}${clean} Cinematic chronological action, precise subject appearance, coherent physical motion, intentional camera framing and movement, soft controlled lighting, detailed environment, and synchronized ambient audio.`,
+-  ).slice(0, 7900);
++  if (clean.length > 900 || /(?:^|\n)\s*(?:#{1,6}\s*)?SCENE\s+\d+/im.test(clean)) return clean;
++  return oneLine(
++    `${continuityContext ? `${continuityContext} ` : ""}${clean} Render one coherent chronological action with precise subject appearance, physically plausible motion, intentional camera framing, controlled lighting, detailed environment, and synchronized scene-appropriate audio. Never speak production instructions, labels, camera notes, or prompt text as dialogue.`,
++  ).slice(0, 11800);
+ }
+diff --git a/lib/schemas.ts b/lib/schemas.ts
+index 49b359d..404e76d 100644
+--- a/lib/schemas.ts
++++ b/lib/schemas.ts
+@@ -2,14 +2,21 @@ import { z } from "zod";
+ 
+ export const sceneSchema = z.object({
+   order: z.number().int().min(1),
+-  title: z.string().min(1).max(100),
+-  prompt: z.string().min(10).max(2500),
+-  duration: z.number().int().min(2).max(15),
++  title: z.string().min(1).max(120),
++  prompt: z.string().min(10).max(5000),
++  duration: z.number().int().min(2).max(20),
++  visual: z.string().max(3000).optional(),
++  action: z.string().max(3000).optional(),
++  camera: z.string().max(1500).optional(),
++  audio: z.string().max(1500).optional(),
++  dialogue: z.string().max(1500).optional(),
++  transition: z.string().max(500).optional(),
++  mustHave: z.array(z.string().max(300)).max(20).optional(),
+ });
+ 
+ export const planSchema = z.object({
+-  prompt: z.string().min(5).max(8000),
+-  durationSeconds: z.number().int().min(5).max(60).default(20),
++  prompt: z.string().min(5).max(12000),
++  durationSeconds: z.number().int().min(5).max(180).default(20),
+   aspectRatio: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
+ });
+ 
+@@ -22,7 +29,8 @@ const fpsSchema = z.union([
+ ]);
+ 
+ export const generationSchema = z.object({
+-  prompt: z.string().min(5).max(8000),
++  clientRequestId: z.string().min(8).max(100).optional(),
++  prompt: z.string().min(5).max(12000),
+   mode: z.enum(["DIRECT", "SCENES"]),
+   videoType: z.enum(["cartoon", "story", "cinematic", "product-ad", "explainer", "social"]).default("cinematic"),
+   model: z.literal("ltx-2.5").default("ltx-2.5"),
+@@ -32,14 +40,44 @@ export const generationSchema = z.object({
+   resolution: z.enum(["720p", "1080p", "1440p", "4k"]).default("1080p"),
+   fps: fpsSchema.default(24),
+   audioQuality: z.enum(["off", "standard", "high"]).default("standard"),
+-  durationSeconds: z.number().int().min(2).max(60),
++  durationSeconds: z.number().int().min(2).max(180),
+   nativeAudio: z.boolean(),
+   enhancePrompt: z.boolean(),
+   seed: z.number().int().min(0).max(2147483647).optional(),
+-  continuityContext: z.string().max(4000).optional(),
+-  scenes: z.array(sceneSchema).max(12).optional(),
++  continuityContext: z.string().max(6000).optional(),
++  scenes: z.array(sceneSchema).max(30).optional(),
+ }).superRefine((value, ctx) => {
+   if (value.mode === "SCENES" && (!value.scenes || value.scenes.length === 0)) {
+     ctx.addIssue({ code: "custom", path: ["scenes"], message: "Scene mode requires at least one scene." });
+   }
+ });
++
++export const editOperationsSchema = z.object({
++  preset: z.enum(["custom", "cinematic", "vivid", "social", "clean"]).default("custom"),
++  trimStart: z.number().min(0).max(7200).default(0),
++  trimEnd: z.number().min(0).max(7200).nullable().optional(),
++  speed: z.number().min(0.25).max(4).default(1),
++  volume: z.number().min(0).max(2).default(1),
++  mute: z.boolean().default(false),
++  fadeIn: z.number().min(0).max(10).default(0),
++  fadeOut: z.number().min(0).max(10).default(0),
++  brightness: z.number().min(-0.5).max(0.5).default(0),
++  contrast: z.number().min(0.5).max(2).default(1),
++  saturation: z.number().min(0).max(3).default(1),
++  sharpen: z.number().min(0).max(2).default(0),
++  blur: z.number().min(0).max(12).default(0),
++  vignette: z.boolean().default(false),
++  normalizeAudio: z.boolean().default(false),
++  crop: z.enum(["original", "16:9", "9:16", "1:1"]).default("original"),
++  rotate: z.union([z.literal(0), z.literal(90), z.literal(180), z.literal(270)]).default(0),
++  mirror: z.boolean().default(false),
++}).superRefine((value, ctx) => {
++  if (value.trimEnd != null && value.trimEnd <= value.trimStart) {
++    ctx.addIssue({ code: "custom", path: ["trimEnd"], message: "Trim end must be after trim start." });
++  }
++});
++
++export const editRequestSchema = z.object({
++  label: z.string().trim().min(1).max(80).default("Edited version"),
++  operations: editOperationsSchema,
++});
+diff --git a/lib/types.ts b/lib/types.ts
+index 902cc24..47b89f2 100644
+--- a/lib/types.ts
++++ b/lib/types.ts
+@@ -7,27 +7,140 @@ export type RenderMode = "fast" | "pro";
+ export type Resolution = "720p" | "1080p" | "1440p" | "4k";
+ export type FrameRate = 24 | 25 | 30 | 48 | 50;
+ export type AudioQuality = "off" | "standard" | "high";
++export type GenerationStatus =
++  | "QUEUED"
++  | "PLANNING"
++  | "GENERATING"
++  | "STITCHING"
++  | "UPLOADING"
++  | "ANALYZING"
++  | "CANCEL_REQUESTED"
++  | "CANCELLED"
++  | "COMPLETED"
++  | "FAILED";
+ 
+ export type ScenePlanItem = {
+   order: number;
+   title: string;
+   prompt: string;
+   duration: number;
++  visual?: string;
++  action?: string;
++  camera?: string;
++  audio?: string;
++  dialogue?: string;
++  transition?: string;
++  mustHave?: string[];
++};
++
++export type ProductionBrief = {
++  title: string;
++  intent: string;
++  visualStyle: string;
++  characters: string[];
++  locations: string[];
++  cameraLanguage: string;
++  audioDirection: string;
++  mustHave: string[];
++  avoid: string[];
++  continuity: string;
++  warnings: string[];
+ };
+ 
+ export type ScenePlan = {
+   summary: string;
+   continuityContext: string;
++  productionBrief: ProductionBrief;
+   scenes: ScenePlanItem[];
+ };
+ 
++export type QCIssue = {
++  code: string;
++  severity: "info" | "warning" | "error";
++  message: string;
++};
++
++export type QCReport = {
++  technicalScore: number;
++  durationSeconds?: number;
++  width?: number;
++  height?: number;
++  fps?: number;
++  videoCodec?: string;
++  audioCodec?: string | null;
++  audioChannels?: number | null;
++  meanVolumeDb?: number | null;
++  maxVolumeDb?: number | null;
++  sampledLumaAverage?: number | null;
++  sampledSaturationAverage?: number | null;
++  blackSegments?: number;
++  freezeSegments?: number;
++  silenceSegments?: number;
++  fileSizeBytes?: number;
++  issues: QCIssue[];
++};
++
++export type EditPreset = "custom" | "cinematic" | "vivid" | "social" | "clean";
++export type CropPreset = "original" | "16:9" | "9:16" | "1:1";
++
++export type VideoEditOperations = {
++  preset: EditPreset;
++  trimStart: number;
++  trimEnd?: number | null;
++  speed: number;
++  volume: number;
++  mute: boolean;
++  fadeIn: number;
++  fadeOut: number;
++  brightness: number;
++  contrast: number;
++  saturation: number;
++  sharpen: number;
++  blur: number;
++  vignette: boolean;
++  normalizeAudio: boolean;
++  crop: CropPreset;
++  rotate: 0 | 90 | 180 | 270;
++  mirror: boolean;
++};
++
++export type VideoVersionState = {
++  id: string;
++  generationId: string;
++  label: string;
++  status: "QUEUED" | "PROCESSING" | "COMPLETED" | "FAILED";
++  outputUrl?: string | null;
++  thumbnailUrl?: string | null;
++  operations: VideoEditOperations;
++  qcReport?: QCReport | null;
++  error?: string | null;
++  createdAt: string;
++};
++
+ export type ModalJobState = {
+   jobId: string;
+-  status: "QUEUED" | "GENERATING" | "STITCHING" | "UPLOADING" | "COMPLETED" | "FAILED";
++  status: GenerationStatus;
+   progress?: number;
+   message?: string;
+   outputUrl?: string;
++  thumbnailUrl?: string;
+   gpuSeconds?: number;
+   actualCost?: number;
++  qcReport?: QCReport;
++  error?: string;
++  callId?: string;
++  cancelRequested?: boolean;
++};
++
++export type ModalEditState = {
++  versionId: string;
++  generationId: string;
++  status: "QUEUED" | "PROCESSING" | "COMPLETED" | "FAILED";
++  progress?: number;
++  message?: string;
++  outputUrl?: string;
++  thumbnailUrl?: string;
++  qcReport?: QCReport;
+   error?: string;
++  callId?: string;
+ };
+diff --git a/modal/README.md b/modal/README.md
+index 5fd3ebc..ca6ac64 100644
+--- a/modal/README.md
++++ b/modal/README.md
+@@ -1,12 +1,43 @@
+-# Modal GPU service
++# Triven Cinema — Modal Runtime
+ 
+-This folder is the serverless inference backend for Triven Cinema.
++`cinema.py` intentionally separates three workloads:
+ 
+-- CPU prefetch caches the gated `Lightricks/LTX-2.5-Diffusers` model into a Modal Volume.
+-- A B200 GPU container starts only when a generation job is submitted.
+-- `max_containers=1` provides a budget safety rail for the MVP.
+-- Preview uses the distilled single-stage path.
+-- 1080p uses distilled generation + latent 2x upscaling + stage-2 refinement, then FFmpeg crops to a standard ratio.
+-- Final MP4s are uploaded to Cloudflare R2/S3-compatible object storage.
++1. **B200 `LTXWorker`** — LTX-2.5 Fast/Pro inference and scene stitching only.
++2. **CPU `finalize_generation`** — technical QC, thumbnailing and optional S3-compatible publishing.
++3. **CPU `edit_video`** — non-destructive FFmpeg edit versions + QC.
+ 
+-See the root `README.md` for the full setup commands.
++## Deploy
++
++```bash
++modal deploy modal/cinema.py
++```
++
++Fast + Pro weights only need to be prefetched when the model cache is missing:
++
++```bash
++modal run modal/cinema.py::prefetch_models
++```
++
++## Cancellation
++
++The web API first writes `cancelRequested=true`, so cancellation is race-safe even if the Modal call ID is not visible yet. `FunctionCall.cancel(terminate_containers=False)` is used so the call is cancelled without intentionally destroying the warm B200 container.
++
++## Warm-container behavior
++
++`LTXWorker` keeps `max_containers=1` and uses a 120-second `scaledown_window`. This improves back-to-back demo renders while keeping GPU concurrency capped. Tune this only after measuring queue time and spend.
++
++## Storage
++
++Without storage credentials, files remain in `triven-cinema-output-cache` (Modal Volume). Media endpoints require a stable HMAC token derived from `TRIVEN_WEB_SECRET`, so generation IDs alone do not expose the files.
++
++Optional keys in `triven-cinema-runtime`:
++
++```text
++STORAGE_S3_ENDPOINT
++STORAGE_S3_ACCESS_KEY_ID
++STORAGE_S3_SECRET_ACCESS_KEY
++STORAGE_S3_BUCKET
++STORAGE_PUBLIC_BASE_URL
++```
++
++The app still keeps a Volume copy so CPU editing can access the source master without downloading it from public storage.
+diff --git a/modal/cinema.py b/modal/cinema.py
+index 938e11c..62669a8 100644
+--- a/modal/cinema.py
++++ b/modal/cinema.py
+@@ -1,24 +1,35 @@
+-"""Triven Cinema Modal backend.
++"""Triven Cinema production-oriented Modal backend.
+ 
+ Deploy:
+   modal deploy modal/cinema.py
+ 
+-Pre-download LTX-2.5 to a persistent CPU-mounted Volume (recommended):
++Prefetch LTX-2.5 Fast + Pro weights:
+   modal run modal/cinema.py::prefetch_models
+ 
+ Required Modal Secret: triven-cinema-runtime
+   HF_TOKEN
+   TRIVEN_WEB_SECRET
+ 
+-Testing output is stored temporarily in a Modal Volume and streamed directly
+-from the Modal API. Cloudflare R2 is not required for the test phase.
++Optional S3-compatible production storage keys in the same secret:
++  STORAGE_S3_ENDPOINT
++  STORAGE_S3_ACCESS_KEY_ID
++  STORAGE_S3_SECRET_ACCESS_KEY
++  STORAGE_S3_BUCKET
++  STORAGE_PUBLIC_BASE_URL
++
++When S3-compatible storage is not configured, outputs remain in a Modal Volume.
+ """
+ 
++import hashlib
++import hmac
++import json
+ import os
++import re
+ import shutil
+ import subprocess
+ import tempfile
+ import time
++import urllib.request
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -27,33 +38,28 @@ import modal
+ APP_NAME = "triven-cinema"
+ MODEL_REPO = "Lightricks/LTX-2.5-Diffusers"
+ CACHE_ROOT = "/cache/huggingface"
++OUTPUT_ROOT = "/outputs"
+ B200_PRICE_PER_SECOND = float(os.environ.get("B200_PRICE_PER_SECOND", "0.001736"))
+ 
+ app = modal.App(APP_NAME)
+ model_cache = modal.Volume.from_name("triven-cinema-model-cache", create_if_missing=True)
+ output_cache = modal.Volume.from_name("triven-cinema-output-cache", create_if_missing=True)
+ jobs = modal.Dict.from_name("triven-cinema-jobs", create_if_missing=True)
++edit_jobs = modal.Dict.from_name("triven-cinema-edit-jobs", create_if_missing=True)
+ runtime_secret = modal.Secret.from_name("triven-cinema-runtime")
+-OUTPUT_ROOT = "/outputs"
+ 
+-web_image = modal.Image.debian_slim(python_version="3.12").pip_install(
+-    "fastapi>=0.118.0",
++web_image = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi>=0.118.0")
++
++editor_image = (
++    modal.Image.debian_slim(python_version="3.12")
++    .apt_install("ffmpeg", "fonts-dejavu-core")
++    .pip_install("boto3>=1.40.0")
+ )
+ 
+ gpu_image = (
+     modal.Image.from_registry("nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04", add_python="3.12")
+-    .apt_install(
+-        "ffmpeg",
+-        "git",
+-        "build-essential",
+-        "gcc",
+-        "g++",
+-        "ninja-build",
+-    )
+-    .env({
+-        "CC": "/usr/bin/gcc",
+-        "CXX": "/usr/bin/g++",
+-    })
++    .apt_install("ffmpeg", "git", "build-essential", "gcc", "g++", "ninja-build", "fonts-dejavu-core")
++    .env({"CC": "/usr/bin/gcc", "CXX": "/usr/bin/g++"})
+     .pip_install(
+         "torch>=2.9.1",
+         "torchvision>=0.24.1",
+@@ -64,6 +70,7 @@ gpu_image = (
+         "sentencepiece>=0.2.1",
+         "protobuf>=6.32.0",
+         "huggingface_hub>=0.35.0",
++        "hf_transfer>=0.1.9",
+         "av>=15.1.0",
+         "imageio-ffmpeg>=0.6.0",
+     )
+@@ -78,6 +85,27 @@ def _auth(secret: str | None) -> None:
+         raise HTTPException(status_code=401, detail="Unauthorized")
+ 
+ 
++def _media_token(kind: str, *parts: str) -> str:
++    secret = os.environ.get("TRIVEN_WEB_SECRET", "")
++    if not secret:
++        return ""
++    payload = "|".join([kind, *parts]).encode("utf-8")
++    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
++
++
++def _require_media_token(token: str | None, kind: str, *parts: str) -> None:
++    expected = _media_token(kind, *parts)
++    if not token or not expected or not hmac.compare_digest(token, expected):
++        from fastapi import HTTPException
++        raise HTTPException(status_code=401, detail="Invalid media token")
++
++
++def _signed_media_url(base: str, path: str, kind: str, *parts: str) -> str:
++    token = _media_token(kind, *parts)
++    separator = "&" if "?" in path else "?"
++    return f"{base}{path}{separator}token={token}"
++
++
+ def _set_job(job_id: str, **values: Any) -> None:
+     current = dict(jobs.get(job_id, {}))
+     current.update(values)
+@@ -86,8 +114,17 @@ def _set_job(job_id: str, **values: Any) -> None:
+     jobs[job_id] = current
+ 
+ 
++def _set_edit(version_id: str, **values: Any) -> None:
++    current = dict(edit_jobs.get(version_id, {}))
++    current.update(values)
++    current["versionId"] = version_id
++    current["updatedAt"] = time.time()
++    edit_jobs[version_id] = current
++
++
+ def _job_cancelled(job_id: str) -> bool:
+-    return bool(dict(jobs.get(job_id, {})).get("cancelled"))
++    state = dict(jobs.get(job_id, {}))
++    return bool(state.get("cancelled") or state.get("cancelRequested"))
+ 
+ 
+ def _normalize_render_mode(value: str) -> str:
+@@ -105,6 +142,8 @@ def _normalize_fps(value: Any) -> int:
+         fps = int(value)
+     except (TypeError, ValueError):
+         return 24
++    # 24/25/48/50 are official LTX-2.5 hosted profiles. 30 remains available for
++    # this self-hosted Diffusers path as an experimental compatibility option.
+     return fps if fps in {24, 25, 30, 48, 50} else 24
+ 
+ 
+@@ -151,13 +190,11 @@ def _render_geometry(aspect: str, resolution: str) -> tuple[int, int, int, int,
+ 
+ 
+ def _frame_count(duration: int, fps: int) -> int:
+-    # LTX video frame counts live on the causal VAE grid: (frames - 1) % 8 == 0.
+     requested_intervals = max(1, int(round((duration * fps) / 8.0)))
+     return requested_intervals * 8 + 1
+ 
+ 
+ def _max_clip_seconds(render_mode: str, resolution: str, fps: int) -> int:
+-    # Conservative production limits. High resolution, Pro and high-FPS shots are split into scenes.
+     if render_mode == "pro" or resolution in {"1440p", "4k"} or fps >= 30:
+         return 10
+     return 20
+@@ -173,15 +210,7 @@ def _audio_bitrate(audio_quality: str) -> str:
+     return "320k" if audio_quality == "high" else "192k"
+ 
+ 
+-def _crop(
+-    input_path: str,
+-    output_path: str,
+-    width: int,
+-    height: int,
+-    render_mode: str,
+-    resolution: str,
+-    audio_quality: str,
+-) -> None:
++def _crop(input_path: str, output_path: str, width: int, height: int, render_mode: str, resolution: str, audio_quality: str) -> None:
+     command = [
+         "ffmpeg", "-y", "-i", input_path,
+         "-vf", f"crop={width}:{height}",
+@@ -204,13 +233,309 @@ def _concat(paths: list[str], output_path: str) -> None:
+     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+ 
+ 
+-def _publish_test_output(path: str, job_id: str) -> str:
+-    """Copy the final MP4 to a temporary Modal Volume for browser playback."""
+-    target = Path(OUTPUT_ROOT) / f"{job_id}.mp4"
+-    target.parent.mkdir(parents=True, exist_ok=True)
+-    shutil.copy2(path, target)
++def _probe(path: str) -> dict[str, Any]:
++    result = subprocess.run([
++        "ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", path,
++    ], check=True, capture_output=True, text=True)
++    return json.loads(result.stdout)
++
++
++def _parse_float(pattern: str, text: str) -> float | None:
++    match = re.search(pattern, text, re.I)
++    if not match:
++        return None
++    try:
++        return float(match.group(1))
++    except (TypeError, ValueError):
++        return None
++
++
++def _analyze_video(path: str, expected_duration: float | None = None) -> dict[str, Any]:
++    """Technical QC: codec/timing + sampled pixel statistics + black/freeze/silence checks."""
++    probe = _probe(path)
++    streams = probe.get("streams", [])
++    video = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
++    audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
++    fmt = probe.get("format", {})
++    duration = float(fmt.get("duration") or video.get("duration") or 0)
++
++    fps = 0.0
++    rate = str(video.get("avg_frame_rate") or "0/1")
++    try:
++        num, den = rate.split("/", 1)
++        fps = float(num) / max(1.0, float(den))
++    except (ValueError, ZeroDivisionError):
++        fps = 0.0
++
++    def filter_stderr(filter_expr: str) -> str:
++        result = subprocess.run([
++            "ffmpeg", "-hide_banner", "-nostats", "-i", path, "-vf", filter_expr, "-an", "-f", "null", "-",
++        ], capture_output=True, text=True)
++        return result.stderr
++
++    black_text = filter_stderr("blackdetect=d=0.25:pix_th=0.10")
++    freeze_text = filter_stderr("freezedetect=n=-60dB:d=0.8")
++    black_segments = len(re.findall(r"black_start:", black_text))
++    freeze_segments = len(re.findall(r"freeze_start:", freeze_text))
++
++    silence_segments = 0
++    mean_volume = None
++    max_volume = None
++    if audio:
++        silence = subprocess.run([
++            "ffmpeg", "-hide_banner", "-nostats", "-i", path, "-af", "silencedetect=n=-50dB:d=0.6", "-f", "null", "-",
++        ], capture_output=True, text=True).stderr
++        silence_segments = len(re.findall(r"silence_start:", silence))
++        volume = subprocess.run([
++            "ffmpeg", "-hide_banner", "-nostats", "-i", path, "-af", "volumedetect", "-f", "null", "-",
++        ], capture_output=True, text=True).stderr
++        mean_volume = _parse_float(r"mean_volume:\s*(-?[\d.]+)\s*dB", volume)
++        max_volume = _parse_float(r"max_volume:\s*(-?[\d.]+)\s*dB", volume)
++
++    stats_file = Path(tempfile.mkdtemp(prefix="triven-qc-")) / "signalstats.txt"
++    try:
++        subprocess.run([
++            "ffmpeg", "-hide_banner", "-nostats", "-i", path,
++            "-vf", f"fps=1,signalstats,metadata=print:file={stats_file}",
++            "-an", "-f", "null", "-",
++        ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++        stats_text = stats_file.read_text(errors="ignore") if stats_file.exists() else ""
++        y_values = [float(value) for value in re.findall(r"lavfi\.signalstats\.YAVG=([\d.]+)", stats_text)]
++        sat_values = [float(value) for value in re.findall(r"lavfi\.signalstats\.SATAVG=([\d.]+)", stats_text)]
++        luma = sum(y_values) / len(y_values) if y_values else None
++        saturation = sum(sat_values) / len(sat_values) if sat_values else None
++    finally:
++        shutil.rmtree(stats_file.parent, ignore_errors=True)
++
++    issues: list[dict[str, str]] = []
++    score = 100
++    if not video:
++        issues.append({"code": "NO_VIDEO", "severity": "error", "message": "No video stream was found."})
++        score -= 60
++    if expected_duration and abs(duration - expected_duration) > max(1.2, expected_duration * 0.08):
++        issues.append({"code": "DURATION_MISMATCH", "severity": "warning", "message": f"Output duration {duration:.2f}s differs from the requested {expected_duration:.2f}s."})
++        score -= 8
++    if black_segments:
++        issues.append({"code": "BLACK_SEGMENTS", "severity": "warning", "message": f"Detected {black_segments} black-frame segment(s)."})
++        score -= min(20, black_segments * 5)
++    if freeze_segments:
++        issues.append({"code": "FREEZE_SEGMENTS", "severity": "warning", "message": f"Detected {freeze_segments} possible frozen-motion segment(s)."})
++        score -= min(20, freeze_segments * 4)
++    if audio and silence_segments > 2:
++        issues.append({"code": "LONG_SILENCE", "severity": "info", "message": f"Detected {silence_segments} silence segment(s); review whether they are intentional."})
++        score -= min(8, silence_segments)
++    if audio and max_volume is not None and max_volume > -0.2:
++        issues.append({"code": "AUDIO_NEAR_CLIP", "severity": "warning", "message": "Audio peaks are close to digital clipping."})
++        score -= 5
++    if luma is not None and (luma < 28 or luma > 225):
++        issues.append({"code": "EXTREME_LUMA", "severity": "warning", "message": "Sampled frames are extremely dark or bright; inspect exposure."})
++        score -= 6
++    if not issues:
++        issues.append({"code": "TECHNICAL_PASS", "severity": "info", "message": "No major technical defects were detected by automated QC."})
++
++    return {
++        "technicalScore": max(0, min(100, score)),
++        "durationSeconds": duration,
++        "width": video.get("width"),
++        "height": video.get("height"),
++        "fps": round(fps, 3),
++        "videoCodec": video.get("codec_name"),
++        "audioCodec": audio.get("codec_name") if audio else None,
++        "audioChannels": audio.get("channels") if audio else None,
++        "meanVolumeDb": mean_volume,
++        "maxVolumeDb": max_volume,
++        "sampledLumaAverage": round(luma, 3) if luma is not None else None,
++        "sampledSaturationAverage": round(saturation, 3) if saturation is not None else None,
++        "blackSegments": black_segments,
++        "freezeSegments": freeze_segments,
++        "silenceSegments": silence_segments,
++        "fileSizeBytes": Path(path).stat().st_size,
++        "issues": issues,
++    }
++
++
++def _make_thumbnail(video_path: str, output_path: str) -> None:
++    probe = _probe(video_path)
++    duration = float(probe.get("format", {}).get("duration") or 1.0)
++    at = max(0.1, min(duration * 0.35, max(0.1, duration - 0.1)))
++    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
++    subprocess.run([
++        "ffmpeg", "-y", "-ss", f"{at:.3f}", "-i", video_path, "-frames:v", "1", "-q:v", "2", output_path,
++    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
++
++def _storage_config() -> dict[str, str] | None:
++    endpoint = os.environ.get("STORAGE_S3_ENDPOINT")
++    key = os.environ.get("STORAGE_S3_ACCESS_KEY_ID")
++    secret = os.environ.get("STORAGE_S3_SECRET_ACCESS_KEY")
++    bucket = os.environ.get("STORAGE_S3_BUCKET")
++    public = os.environ.get("STORAGE_PUBLIC_BASE_URL")
++    if all([endpoint, key, secret, bucket, public]):
++        return {"endpoint": endpoint, "key": key, "secret": secret, "bucket": bucket, "public": public.rstrip("/")}
++    return None
++
++
++def _upload_if_configured(path: str, key_name: str, content_type: str) -> str | None:
++    config = _storage_config()
++    if not config:
++        return None
++    import boto3
++    client = boto3.client(
++        "s3",
++        endpoint_url=config["endpoint"],
++        aws_access_key_id=config["key"],
++        aws_secret_access_key=config["secret"],
++    )
++    client.upload_file(path, config["bucket"], key_name, ExtraArgs={"ContentType": content_type, "CacheControl": "public, max-age=31536000, immutable"})
++    return f"{config['public']}/{key_name}"
++
++
++def _delete_storage_prefix(prefix: str) -> None:
++    config = _storage_config()
++    if not config:
++        return
++    import boto3
++    client = boto3.client(
++        "s3",
++        endpoint_url=config["endpoint"],
++        aws_access_key_id=config["key"],
++        aws_secret_access_key=config["secret"],
++    )
++    continuation: str | None = None
++    while True:
++        kwargs: dict[str, Any] = {"Bucket": config["bucket"], "Prefix": prefix}
++        if continuation:
++            kwargs["ContinuationToken"] = continuation
++        response = client.list_objects_v2(**kwargs)
++        objects = [{"Key": item["Key"]} for item in response.get("Contents", []) if item.get("Key")]
++        if objects:
++            client.delete_objects(Bucket=config["bucket"], Delete={"Objects": objects, "Quiet": True})
++        if not response.get("IsTruncated"):
++            break
++        continuation = response.get("NextContinuationToken")
++        if not continuation:
++            break
++
++
++def _publish_master(path: str, job_id: str) -> tuple[str, str, str | None, str | None]:
++    directory = Path(OUTPUT_ROOT) / job_id
++    directory.mkdir(parents=True, exist_ok=True)
++    video_target = directory / "master.mp4"
++    thumb_target = directory / "thumbnail.jpg"
++    shutil.copy2(path, video_target)
++    _make_thumbnail(str(video_target), str(thumb_target))
++    output_cache.commit()
++    remote_video = _upload_if_configured(str(video_target), f"generations/{job_id}/master.mp4", "video/mp4")
++    remote_thumb = _upload_if_configured(str(thumb_target), f"generations/{job_id}/thumbnail.jpg", "image/jpeg")
++    return str(video_target), str(thumb_target), remote_video, remote_thumb
++
++
++@app.function(
++    image=editor_image,
++    volumes={OUTPUT_ROOT: output_cache},
++    secrets=[runtime_secret],
++    timeout=1800,
++    min_containers=0,
++    max_containers=4,
++    scaledown_window=60,
++)
++def finalize_generation(request: dict[str, Any]) -> dict[str, Any]:
++    """Run QC, thumbnails and optional object-storage publishing on CPU after GPU inference."""
++    job_id = str(request["jobId"])
++    staging_path = Path(str(request["stagingPath"]))
++    profile = str(request.get("profile") or "LTX-2.5")
++    expected_duration = float(request.get("expectedDuration") or 0) or None
++    gpu_seconds = float(request.get("gpuSeconds") or 0)
++    actual_cost = float(request.get("actualCost") or 0)
++    try:
++        if _job_cancelled(job_id):
++            _set_job(job_id, status="CANCELLED", progress=0, message="Generation stopped by user", error=None, cancelled=True)
++            return dict(jobs.get(job_id, {}))
++        output_cache.reload()
++        if not staging_path.exists():
++            raise FileNotFoundError(f"Staged master not found: {staging_path}")
++        _set_job(job_id, status="ANALYZING", progress=92, message="Running technical quality control")
++        qc_report = _analyze_video(str(staging_path), expected_duration=expected_duration)
++
++        if _job_cancelled(job_id):
++            _set_job(job_id, status="CANCELLED", progress=0, message="Generation stopped by user", error=None, cancelled=True)
++            return dict(jobs.get(job_id, {}))
++        _set_job(job_id, status="UPLOADING", progress=96, message="Publishing master and thumbnail")
++        directory = Path(OUTPUT_ROOT) / job_id
++        directory.mkdir(parents=True, exist_ok=True)
++        master_path = directory / "master.mp4"
++        thumb_path = directory / "thumbnail.jpg"
++        if staging_path != master_path:
++            shutil.move(str(staging_path), str(master_path))
++        _make_thumbnail(str(master_path), str(thumb_path))
++        output_cache.commit()
++        output_url = _upload_if_configured(str(master_path), f"generations/{job_id}/master.mp4", "video/mp4")
++        thumbnail_url = _upload_if_configured(str(thumb_path), f"generations/{job_id}/thumbnail.jpg", "image/jpeg")
++
++        if _job_cancelled(job_id):
++            _set_job(job_id, status="CANCELLED", progress=0, message="Generation stopped by user", error=None, cancelled=True)
++            return dict(jobs.get(job_id, {}))
++
++        result = {
++            "jobId": job_id,
++            "status": "COMPLETED",
++            "progress": 100,
++            "message": f"Render complete | {profile} | QC {qc_report['technicalScore']}/100",
++            "outputPath": str(master_path),
++            "thumbnailPath": str(thumb_path),
++            "outputUrl": output_url,
++            "thumbnailUrl": thumbnail_url,
++            "gpuSeconds": gpu_seconds,
++            "actualCost": actual_cost,
++            "qcReport": qc_report,
++        }
++        _set_job(job_id, **result)
++        return result
++    except Exception as exc:
++        _set_job(job_id, status="FAILED", progress=0, message="Finalization failed", error=str(exc), gpuSeconds=gpu_seconds, actualCost=actual_cost)
++        raise
++
++
++@app.function(
++    image=editor_image,
++    volumes={OUTPUT_ROOT: output_cache},
++    secrets=[runtime_secret],
++    timeout=600,
++    min_containers=0,
++    max_containers=2,
++    scaledown_window=30,
++)
++def cleanup_generation(job_id: str) -> dict[str, Any]:
++    """Delete retained media for a terminal generation from Volume and optional object storage."""
++    output_cache.reload()
++    directory = Path(OUTPUT_ROOT) / job_id
++    legacy = Path(OUTPUT_ROOT) / f"{job_id}.mp4"
++    if directory.exists():
++        shutil.rmtree(directory, ignore_errors=True)
++    if legacy.exists():
++        legacy.unlink(missing_ok=True)
++    output_cache.commit()
++    _delete_storage_prefix(f"generations/{job_id}/")
++    return {"ok": True, "jobId": job_id}
++
++
++@app.function(
++    image=editor_image,
++    volumes={OUTPUT_ROOT: output_cache},
++    secrets=[runtime_secret],
++    timeout=300,
++    min_containers=0,
++    max_containers=2,
++    scaledown_window=30,
++)
++def cleanup_video_version(generation_id: str, version_id: str) -> dict[str, Any]:
++    output_cache.reload()
++    version_dir = Path(OUTPUT_ROOT) / generation_id / "versions"
++    (version_dir / f"{version_id}.mp4").unlink(missing_ok=True)
++    (version_dir / f"{version_id}.jpg").unlink(missing_ok=True)
+     output_cache.commit()
+-    return str(target)
++    _delete_storage_prefix(f"generations/{generation_id}/versions/{version_id}")
++    return {"ok": True, "generationId": generation_id, "versionId": version_id}
+ 
+ 
+ @app.function(
+@@ -225,19 +550,8 @@ def prefetch_models():
+ 
+     os.environ["HF_HOME"] = CACHE_ROOT
+     token = os.environ.get("HF_TOKEN")
+-
+-    base_path = snapshot_download(
+-        MODEL_REPO,
+-        cache_dir=CACHE_ROOT,
+-        token=token,
+-        ignore_patterns=["transformer_full/*"],
+-    )
+-    snapshot_download(
+-        MODEL_REPO,
+-        cache_dir=CACHE_ROOT,
+-        token=token,
+-        allow_patterns=["transformer_full/*"],
+-    )
++    base_path = snapshot_download(MODEL_REPO, cache_dir=CACHE_ROOT, token=token, ignore_patterns=["transformer_full/*"])
++    snapshot_download(MODEL_REPO, cache_dir=CACHE_ROOT, token=token, allow_patterns=["transformer_full/*"])
+     model_cache.commit()
+     print(f"Cached LTX-2.5 Fast and Pro components at {base_path}")
+ 
+@@ -250,7 +564,7 @@ def prefetch_models():
+     timeout=7200,
+     min_containers=0,
+     max_containers=1,
+-    scaledown_window=30,
++    scaledown_window=120,
+ )
+ class LTXWorker:
+     @modal.enter()
+@@ -260,50 +574,29 @@ class LTXWorker:
+         from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+ 
+         token = os.environ.get("HF_TOKEN")
+-        self.pipe = LTX2Pipeline.from_pretrained(
+-            MODEL_REPO,
+-            torch_dtype=torch.bfloat16,
+-            cache_dir=CACHE_ROOT,
+-            token=token,
+-        )
++        self.pipe = LTX2Pipeline.from_pretrained(MODEL_REPO, torch_dtype=torch.bfloat16, cache_dir=CACHE_ROOT, token=token)
+         self.pipe.to("cuda")
+         self.pipe.vae.enable_tiling()
+-
+         self.fast_transformer = self.pipe.transformer
+         self.fast_scheduler = self.pipe.scheduler
+         self.pro_transformer = None
+         self.pro_scheduler = None
+         self.scheduler_cls = FlowMatchEulerDiscreteScheduler
+         self.token = token
+-
+         self.upsampler_model = LTX2LatentUpsamplerModel.from_pretrained(
+-            MODEL_REPO,
+-            subfolder="latent_upsampler",
+-            torch_dtype=torch.bfloat16,
+-            cache_dir=CACHE_ROOT,
+-            token=token,
++            MODEL_REPO, subfolder="latent_upsampler", torch_dtype=torch.bfloat16, cache_dir=CACHE_ROOT, token=token,
+         ).to("cuda")
+         self.upsample_pipe = LTX2LatentUpsamplePipeline(vae=self.pipe.vae, latent_upsampler=self.upsampler_model)
+ 
+     def _ensure_pro(self) -> None:
+         if self.pro_transformer is not None:
+             return
+-
+         import torch
+         from diffusers import LTX2VideoTransformer3DModel
+-
+         self.pro_transformer = LTX2VideoTransformer3DModel.from_pretrained(
+-            MODEL_REPO,
+-            subfolder="transformer_full",
+-            torch_dtype=torch.bfloat16,
+-            cache_dir=CACHE_ROOT,
+-            token=self.token,
++            MODEL_REPO, subfolder="transformer_full", torch_dtype=torch.bfloat16, cache_dir=CACHE_ROOT, token=self.token,
+         ).to("cuda")
+-        self.pro_scheduler = self.scheduler_cls.from_config(
+-            self.fast_scheduler.config,
+-            use_dynamic_shifting=True,
+-            shift_terminal=0.1,
+-        )
++        self.pro_scheduler = self.scheduler_cls.from_config(self.fast_scheduler.config, use_dynamic_shifting=True, shift_terminal=0.1)
+ 
+     def _activate_mode(self, render_mode: str) -> None:
+         if render_mode == "pro":
+@@ -316,7 +609,6 @@ class LTXWorker:
+ 
+     def _fast_kwargs(self) -> dict[str, Any]:
+         from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+-
+         return {
+             "sigmas": DISTILLED_SIGMA_VALUES,
+             "guidance_scale": 1.0,
+@@ -345,19 +637,7 @@ class LTXWorker:
+             "use_cross_timestep": True,
+         }
+ 
+-    def _render_clip(
+-        self,
+-        prompt: str,
+-        aspect: str,
+-        render_mode: str,
+-        resolution: str,
+-        fps: int,
+-        duration: int,
+-        audio_quality: str,
+-        seed: int,
+-        out_dir: str,
+-        index: int,
+-    ) -> str:
++    def _render_clip(self, prompt: str, aspect: str, render_mode: str, resolution: str, fps: int, duration: int, audio_quality: str, seed: int, out_dir: str, index: int) -> str:
+         import torch
+         from diffusers.pipelines.ltx2.utils import DEFAULT_NEGATIVE_PROMPT, STAGE_2_DISTILLED_SIGMA_VALUES
+         from diffusers.utils import encode_video
+@@ -373,7 +653,6 @@ class LTXWorker:
+ 
+         self._activate_mode(render_mode)
+         stage_one = self._pro_kwargs() if render_mode == "pro" else self._fast_kwargs()
+-
+         if upscale_count == 0:
+             video, audio = self.pipe(
+                 prompt=prompt,
+@@ -400,16 +679,9 @@ class LTXWorker:
+                 return_dict=False,
+                 **stage_one,
+             )
+-
+             upscaled_video_latent = video_latent
+             for _ in range(upscale_count):
+-                upscaled_video_latent = self.upsample_pipe(
+-                    latents=upscaled_video_latent,
+-                    output_type="latent",
+-                    return_dict=False,
+-                )[0]
+-
+-            # The reference two-stage refinement is distilled, even when the creative pass used Full/SFT.
++                upscaled_video_latent = self.upsample_pipe(latents=upscaled_video_latent, output_type="latent", return_dict=False)[0]
+             self._activate_mode("fast")
+             video, audio = self.pipe(
+                 latents=upscaled_video_latent,
+@@ -449,13 +721,14 @@ class LTXWorker:
+         started = time.time()
+         temp_dir = tempfile.mkdtemp(prefix=f"triven-{job_id}-")
+         try:
++            if _job_cancelled(job_id):
++                _set_job(job_id, status="CANCELLED", progress=0, message="Generation stopped by user", error=None, cancelled=True)
++                return dict(jobs.get(job_id, {}))
++
+             render_mode = _normalize_render_mode(str(request.get("renderMode", "fast")))
+             resolution = _normalize_resolution(str(request.get("resolution", "1080p")))
+             fps = _normalize_fps(request.get("fps", 24))
+-            audio_quality = _normalize_audio_quality(
+-                str(request.get("audioQuality", "standard")),
+-                bool(request.get("nativeAudio", True)),
+-            )
++            audio_quality = _normalize_audio_quality(str(request.get("audioQuality", "standard")), bool(request.get("nativeAudio", True)))
+             profile = _profile_label(render_mode, resolution, fps, audio_quality)
+             clip_limit = _max_clip_seconds(render_mode, resolution, fps)
+ 
+@@ -471,82 +744,57 @@ class LTXWorker:
+                         raise RuntimeError("Generation stopped by user")
+                     scene_duration = int(scene.get("duration", 5))
+                     if scene_duration > clip_limit:
+-                        raise ValueError(
+-                            f"This render profile supports up to {clip_limit}s per scene. "
+-                            f"Scene {i + 1} is {scene_duration}s; split it into shorter scenes."
+-                        )
+-                    progress = 12 + int((i / total) * 68)
+-                    _set_job(job_id, status="GENERATING", progress=progress, message=f"Rendering scene {i + 1} of {total} | {profile}")
++                        raise ValueError(f"This render profile supports up to {clip_limit}s per scene; scene {i + 1} is {scene_duration}s.")
++                    progress = 12 + int((i / total) * 66)
++                    _set_job(job_id, status="GENERATING", progress=progress, message=f"Rendering scene {i + 1} of {total} | {profile}", sceneIndex=i + 1, sceneCount=total)
+                     clips.append(self._render_clip(
+-                        prompt=scene["prompt"],
+-                        aspect=request["aspectRatio"],
+-                        render_mode=render_mode,
+-                        resolution=resolution,
+-                        fps=fps,
+-                        duration=scene_duration,
+-                        audio_quality=audio_quality,
+-                        seed=int(request.get("seed", 42)),
+-                        out_dir=temp_dir,
+-                        index=i,
++                        prompt=scene["prompt"], aspect=request["aspectRatio"], render_mode=render_mode, resolution=resolution,
++                        fps=fps, duration=scene_duration, audio_quality=audio_quality, seed=int(request.get("seed", 42)), out_dir=temp_dir, index=i,
+                     ))
+             else:
+                 direct_duration = int(request.get("durationSeconds", 5))
+                 if direct_duration > clip_limit:
+-                    raise ValueError(
+-                        f"{profile} supports up to {clip_limit}s per direct clip in Triven Cinema. "
+-                        "Use scene mode for longer videos."
+-                    )
++                    raise ValueError(f"{profile} supports up to {clip_limit}s per direct clip. Use scene mode for longer videos.")
+                 _set_job(job_id, status="GENERATING", progress=20, message=f"Rendering video | {profile}")
+                 clips.append(self._render_clip(
+-                    prompt=request["prompt"],
+-                    aspect=request["aspectRatio"],
+-                    render_mode=render_mode,
+-                    resolution=resolution,
+-                    fps=fps,
+-                    duration=direct_duration,
+-                    audio_quality=audio_quality,
+-                    seed=int(request.get("seed", 42)),
+-                    out_dir=temp_dir,
+-                    index=0,
++                    prompt=request["prompt"], aspect=request["aspectRatio"], render_mode=render_mode, resolution=resolution,
++                    fps=fps, duration=direct_duration, audio_quality=audio_quality, seed=int(request.get("seed", 42)), out_dir=temp_dir, index=0,
+                 ))
+ 
+             if _job_cancelled(job_id):
+                 raise RuntimeError("Generation stopped by user")
+ 
+             final_path = str(Path(temp_dir) / "final.mp4")
+-            _set_job(job_id, status="STITCHING", progress=84, message="Composing final MP4")
++            _set_job(job_id, status="STITCHING", progress=82, message="Composing final MP4")
+             if len(clips) == 1:
+                 shutil.copy2(clips[0], final_path)
+             else:
+                 _concat(clips, final_path)
+ 
+-            _set_job(job_id, status="UPLOADING", progress=93, message="Preparing video for playback")
+-            output_path = _publish_test_output(final_path, job_id)
++            # End expensive B200 work here. Copy the master to the shared Volume, then hand
++            # technical QC, thumbnailing and object-storage publishing to a CPU worker.
++            stage_dir = Path(OUTPUT_ROOT) / job_id
++            stage_dir.mkdir(parents=True, exist_ok=True)
++            staging_path = stage_dir / "staging.mp4"
++            shutil.copy2(final_path, staging_path)
++            output_cache.commit()
+             gpu_seconds = time.time() - started
+             actual_cost = gpu_seconds * B200_PRICE_PER_SECOND
+-            result = {
++            _set_job(job_id, status="ANALYZING", progress=88, message="GPU render complete; handing off to CPU quality control", gpuSeconds=gpu_seconds, actualCost=actual_cost)
++            finalize_call = finalize_generation.spawn({
+                 "jobId": job_id,
+-                "status": "COMPLETED",
+-                "progress": 100,
+-                "message": f"Render complete | {profile}",
+-                "outputPath": output_path,
++                "stagingPath": str(staging_path),
++                "profile": profile,
++                "expectedDuration": float(request.get("durationSeconds") or 0),
+                 "gpuSeconds": gpu_seconds,
+                 "actualCost": actual_cost,
+-            }
+-            _set_job(job_id, **result)
+-            return result
++            })
++            _set_job(job_id, finalizeCallId=finalize_call.object_id)
++            return dict(jobs.get(job_id, {}))
+         except Exception as exc:
+             gpu_seconds = time.time() - started
+             if _job_cancelled(job_id):
+-                _set_job(
+-                    job_id,
+-                    status="FAILED",
+-                    message="Generation stopped by user",
+-                    error=None,
+-                    gpuSeconds=gpu_seconds,
+-                    actualCost=gpu_seconds * B200_PRICE_PER_SECOND,
+-                    cancelled=True,
+-                )
++                _set_job(job_id, status="CANCELLED", progress=0, message="Generation stopped by user", error=None, gpuSeconds=gpu_seconds, actualCost=gpu_seconds * B200_PRICE_PER_SECOND, cancelled=True)
+                 return dict(jobs.get(job_id, {}))
+             _set_job(job_id, status="FAILED", progress=0, message="Render failed", error=str(exc), gpuSeconds=gpu_seconds, actualCost=gpu_seconds * B200_PRICE_PER_SECOND)
+             raise
+@@ -554,6 +802,183 @@ class LTXWorker:
+             shutil.rmtree(temp_dir, ignore_errors=True)
+ 
+ 
++def _atempo_chain(speed: float) -> str:
++    factors: list[float] = []
++    remaining = speed
++    while remaining > 2.0:
++        factors.append(2.0)
++        remaining /= 2.0
++    while remaining < 0.5:
++        factors.append(0.5)
++        remaining /= 0.5
++    factors.append(remaining)
++    return ",".join(f"atempo={factor:.6f}" for factor in factors)
++
++
++def _preset_adjustments(preset: str) -> tuple[float, float, float]:
++    if preset == "cinematic":
++        return (-0.015, 1.08, 0.92)
++    if preset == "vivid":
++        return (0.01, 1.07, 1.18)
++    if preset == "social":
++        return (0.015, 1.10, 1.22)
++    if preset == "clean":
++        return (0.0, 1.03, 1.0)
++    return (0.0, 1.0, 1.0)
++
++
++def _crop_filter(crop: str) -> str | None:
++    if crop == "16:9":
++        return "crop=w='min(iw,ih*16/9)':h='min(ih,iw*9/16)'"
++    if crop == "9:16":
++        return "crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)'"
++    if crop == "1:1":
++        return "crop=w='min(iw,ih)':h='min(iw,ih)'"
++    return None
++
++
++@app.function(
++    image=editor_image,
++    volumes={OUTPUT_ROOT: output_cache},
++    secrets=[runtime_secret],
++    timeout=1800,
++    min_containers=0,
++    max_containers=4,
++    scaledown_window=60,
++)
++def edit_video(request: dict[str, Any]) -> dict[str, Any]:
++    version_id = str(request["versionId"])
++    generation_id = str(request["generationId"])
++    operations = dict(request.get("operations") or {})
++    temp_dir = tempfile.mkdtemp(prefix=f"triven-edit-{version_id}-")
++    try:
++        _set_edit(version_id, generationId=generation_id, status="PROCESSING", progress=8, message="Preparing source video")
++        local_master = Path(OUTPUT_ROOT) / generation_id / "master.mp4"
++        if local_master.exists():
++            source = str(local_master)
++        else:
++            source_url = str(request.get("sourceUrl") or "")
++            if not source_url.startswith(("https://", "http://")):
++                raise ValueError("Source video is unavailable for editing")
++            source = str(Path(temp_dir) / "source.mp4")
++            urllib.request.urlretrieve(source_url, source)
++
++        probe = _probe(source)
++        streams = probe.get("streams", [])
++        has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
++        source_duration = float(probe.get("format", {}).get("duration") or 0)
++        start = max(0.0, float(operations.get("trimStart", 0) or 0))
++        raw_end = operations.get("trimEnd")
++        end = source_duration if raw_end in (None, "") else min(source_duration, float(raw_end))
++        if end <= start:
++            raise ValueError("Trim end must be after trim start")
++        speed = max(0.25, min(4.0, float(operations.get("speed", 1) or 1)))
++        clipped_duration = max(0.05, end - start)
++        output_duration = clipped_duration / speed
++
++        preset_brightness, preset_contrast, preset_saturation = _preset_adjustments(str(operations.get("preset", "custom")))
++        brightness = max(-0.5, min(0.5, float(operations.get("brightness", 0) or 0) + preset_brightness))
++        contrast = max(0.5, min(2.0, float(operations.get("contrast", 1) or 1) * preset_contrast))
++        saturation = max(0.0, min(3.0, float(operations.get("saturation", 1) or 1) * preset_saturation))
++        sharpen = max(0.0, min(2.0, float(operations.get("sharpen", 0) or 0)))
++        blur = max(0.0, min(12.0, float(operations.get("blur", 0) or 0)))
++        vignette = bool(operations.get("vignette", False))
++        normalize_audio = bool(operations.get("normalizeAudio", False))
++        fade_in = max(0.0, min(float(operations.get("fadeIn", 0) or 0), output_duration / 2))
++        fade_out = max(0.0, min(float(operations.get("fadeOut", 0) or 0), output_duration / 2))
++
++        video_filters: list[str] = []
++        crop = _crop_filter(str(operations.get("crop", "original")))
++        if crop:
++            video_filters.append(crop)
++        rotate = int(operations.get("rotate", 0) or 0)
++        if rotate == 90:
++            video_filters.append("transpose=1")
++        elif rotate == 270:
++            video_filters.append("transpose=2")
++        elif rotate == 180:
++            video_filters.extend(["hflip", "vflip"])
++        if bool(operations.get("mirror", False)):
++            video_filters.append("hflip")
++        if speed != 1.0:
++            video_filters.append(f"setpts=PTS/{speed:.6f}")
++        if brightness != 0.0 or contrast != 1.0 or saturation != 1.0:
++            video_filters.append(f"eq=brightness={brightness:.4f}:contrast={contrast:.4f}:saturation={saturation:.4f}")
++        if sharpen > 0:
++            amount = min(2.0, sharpen)
++            video_filters.append(f"unsharp=5:5:{amount:.4f}:5:5:0")
++        if blur > 0:
++            radius = max(1, min(12, int(round(blur))))
++            video_filters.append(f"boxblur=luma_radius={radius}:luma_power=1")
++        if vignette:
++            video_filters.append("vignette=PI/5")
++        if fade_in > 0:
++            video_filters.append(f"fade=t=in:st=0:d={fade_in:.3f}")
++        if fade_out > 0:
++            video_filters.append(f"fade=t=out:st={max(0.0, output_duration - fade_out):.3f}:d={fade_out:.3f}")
++        video_filters.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
++
++        audio_filters: list[str] = []
++        mute = bool(operations.get("mute", False))
++        if has_audio and not mute:
++            if speed != 1.0:
++                audio_filters.append(_atempo_chain(speed))
++            volume = max(0.0, min(2.0, float(operations.get("volume", 1) or 1)))
++            if volume != 1.0:
++                audio_filters.append(f"volume={volume:.4f}")
++            if normalize_audio:
++                audio_filters.append("loudnorm=I=-16:LRA=11:TP=-1.5")
++            if fade_in > 0:
++                audio_filters.append(f"afade=t=in:st=0:d={fade_in:.3f}")
++            if fade_out > 0:
++                audio_filters.append(f"afade=t=out:st={max(0.0, output_duration - fade_out):.3f}:d={fade_out:.3f}")
++
++        _set_edit(version_id, generationId=generation_id, status="PROCESSING", progress=38, message="Rendering non-destructive edit")
++        out_dir = Path(OUTPUT_ROOT) / generation_id / "versions"
++        out_dir.mkdir(parents=True, exist_ok=True)
++        output_path = out_dir / f"{version_id}.mp4"
++        thumb_path = out_dir / f"{version_id}.jpg"
++
++        command = ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{clipped_duration:.3f}", "-i", source]
++        if video_filters:
++            command += ["-vf", ",".join(video_filters)]
++        command += ["-c:v", "libx264", "-preset", "medium", "-crf", "16"]
++        if mute or not has_audio:
++            command += ["-an"]
++        else:
++            if audio_filters:
++                command += ["-af", ",".join(audio_filters)]
++            command += ["-c:a", "aac", "-b:a", "256k"]
++        command += ["-movflags", "+faststart", str(output_path)]
++        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
++        _set_edit(version_id, generationId=generation_id, status="PROCESSING", progress=78, message="Running technical QC")
++        qc_report = _analyze_video(str(output_path), expected_duration=output_duration)
++        _make_thumbnail(str(output_path), str(thumb_path))
++        output_cache.commit()
++        output_url = _upload_if_configured(str(output_path), f"generations/{generation_id}/versions/{version_id}.mp4", "video/mp4")
++        thumbnail_url = _upload_if_configured(str(thumb_path), f"generations/{generation_id}/versions/{version_id}.jpg", "image/jpeg")
++        result = {
++            "versionId": version_id,
++            "generationId": generation_id,
++            "status": "COMPLETED",
++            "progress": 100,
++            "message": f"Edit complete | QC {qc_report['technicalScore']}/100",
++            "outputPath": str(output_path),
++            "thumbnailPath": str(thumb_path),
++            "outputUrl": output_url,
++            "thumbnailUrl": thumbnail_url,
++            "qcReport": qc_report,
++        }
++        _set_edit(version_id, **result)
++        return result
++    except Exception as exc:
++        _set_edit(version_id, generationId=generation_id, status="FAILED", progress=0, message="Edit failed", error=str(exc))
++        raise
++    finally:
++        shutil.rmtree(temp_dir, ignore_errors=True)
++
++
+ @app.function(image=web_image, secrets=[runtime_secret], volumes={OUTPUT_ROOT: output_cache})
+ @modal.asgi_app()
+ def api():
+@@ -564,7 +989,15 @@ def api():
+ 
+     @service.get("/health")
+     def health():
+-        return {"ok": True, "model": "LTX-2.5", "gpu": "B200", "modes": ["fast", "pro"], "resolutions": ["720p", "1080p", "1440p", "4k"], "fps": [24, 25, 30, 48, 50]}
++        return {
++            "ok": True,
++            "model": "LTX-2.5",
++            "gpu": "B200",
++            "modes": ["fast", "pro"],
++            "resolutions": ["720p", "1080p", "1440p", "4k"],
++            "fps": [24, 25, 30, 48, 50],
++            "features": ["cancel", "media-cleanup", "technical-qc", "signed-volume-media", "thumbnails", "non-destructive-editing", "optional-s3-storage"],
++        }
+ 
+     @service.post("/submit")
+     def submit(payload: dict[str, Any], x_triven_secret: str | None = Header(default=None)):
+@@ -572,9 +1005,15 @@ def api():
+         job_id = str(payload.get("jobId", "")).strip()
+         if not job_id:
+             raise HTTPException(status_code=400, detail="jobId is required")
+-        _set_job(job_id, status="QUEUED", progress=3, message="Queued for B200", cancelled=False)
++        _set_job(job_id, status="QUEUED", progress=3, message="Queued for B200", cancelled=False, cancelRequested=False)
+         call = LTXWorker().generate.spawn(payload)
+         _set_job(job_id, callId=call.object_id)
++        latest = dict(jobs.get(job_id, {}))
++        if latest.get("cancelRequested"):
++            try:
++                modal.FunctionCall.from_id(str(call.object_id)).cancel(terminate_containers=False)
++            finally:
++                _set_job(job_id, status="CANCELLED", progress=0, message="Generation stopped by user", cancelled=True)
+         return {"jobId": job_id, "callId": call.object_id}
+ 
+     @service.post("/cancel/{job_id}")
+@@ -583,29 +1022,34 @@ def api():
+         state = jobs.get(job_id)
+         if state is None:
+             raise HTTPException(status_code=404, detail="Job not found")
+-
+         state = dict(state)
+-        if state.get("status") in {"COMPLETED", "FAILED"}:
++        if state.get("status") in {"COMPLETED", "FAILED", "CANCELLED"}:
+             return state
+ 
+-        call_id = state.get("callId")
++        _set_job(job_id, status="CANCEL_REQUESTED", message="Stopping generation", cancelRequested=True)
++        latest = dict(jobs.get(job_id, {}))
++        call_id = latest.get("finalizeCallId") or latest.get("callId")
+         if not call_id:
+-            raise HTTPException(status_code=409, detail="GPU call is still starting")
+-
++            return latest
+         try:
+             modal.FunctionCall.from_id(str(call_id)).cancel(terminate_containers=False)
+         except Exception as exc:
+-            raise HTTPException(status_code=502, detail=f"Could not cancel GPU call: {exc}") from exc
+-
+-        _set_job(
+-            job_id,
+-            status="FAILED",
+-            message="Generation stopped by user",
+-            error=None,
+-            cancelled=True,
+-        )
++            # Keep cancelRequested=true so the worker exits at its next safe checkpoint.
++            _set_job(job_id, message=f"Stop requested; waiting for worker checkpoint ({exc})")
++            return dict(jobs.get(job_id, {}))
++
++        _set_job(job_id, status="CANCELLED", progress=0, message="Generation stopped by user", error=None, cancelled=True)
+         return dict(jobs.get(job_id, {}))
+ 
++    @service.delete("/delete/{job_id}")
++    def delete_generation(job_id: str, x_triven_secret: str | None = Header(default=None)):
++        _auth(x_triven_secret)
++        state = jobs.get(job_id)
++        if state is not None and dict(state).get("status") not in {"COMPLETED", "FAILED", "CANCELLED"}:
++            raise HTTPException(status_code=409, detail="Active generation must be stopped before deletion")
++        result = cleanup_generation.remote(job_id)
++        return result
++
+     @service.get("/status/{job_id}")
+     def status(job_id: str, request: Request, x_triven_secret: str | None = Header(default=None)):
+         _auth(x_triven_secret)
+@@ -613,23 +1057,87 @@ def api():
+         if state is None:
+             raise HTTPException(status_code=404, detail="Job not found")
+         state = dict(state)
+-        if state.get("status") == "COMPLETED" and state.get("outputPath"):
+-            state["outputUrl"] = str(request.base_url).rstrip("/") + f"/video/{job_id}"
++        if state.get("status") == "COMPLETED":
++            base = str(request.base_url).rstrip("/")
++            if not state.get("outputUrl") and state.get("outputPath"):
++                state["outputUrl"] = _signed_media_url(base, f"/video/{job_id}", "video", job_id)
++            if not state.get("thumbnailUrl") and state.get("thumbnailPath"):
++                state["thumbnailUrl"] = _signed_media_url(base, f"/thumbnail/{job_id}", "thumbnail", job_id)
++        return state
++
++    @service.post("/edit/submit")
++    def submit_edit(payload: dict[str, Any], x_triven_secret: str | None = Header(default=None)):
++        _auth(x_triven_secret)
++        version_id = str(payload.get("versionId", "")).strip()
++        generation_id = str(payload.get("generationId", "")).strip()
++        if not version_id or not generation_id:
++            raise HTTPException(status_code=400, detail="versionId and generationId are required")
++        _set_edit(version_id, generationId=generation_id, status="QUEUED", progress=3, message="Queued for CPU editor")
++        call = edit_video.spawn(payload)
++        _set_edit(version_id, callId=call.object_id)
++        return {"versionId": version_id, "callId": call.object_id}
++
++    @service.delete("/edit/delete/{generation_id}/{version_id}")
++    def delete_edit(generation_id: str, version_id: str, x_triven_secret: str | None = Header(default=None)):
++        _auth(x_triven_secret)
++        state = edit_jobs.get(version_id)
++        if state is not None and dict(state).get("status") in {"QUEUED", "PROCESSING"}:
++            raise HTTPException(status_code=409, detail="Active edit cannot be deleted")
++        return cleanup_video_version.remote(generation_id, version_id)
++
++    @service.get("/edit/status/{version_id}")
++    def edit_status(version_id: str, request: Request, x_triven_secret: str | None = Header(default=None)):
++        _auth(x_triven_secret)
++        state = edit_jobs.get(version_id)
++        if state is None:
++            raise HTTPException(status_code=404, detail="Edit job not found")
++        state = dict(state)
++        if state.get("status") == "COMPLETED":
++            base = str(request.base_url).rstrip("/")
++            generation_id = state.get("generationId")
++            if not state.get("outputUrl") and state.get("outputPath"):
++                state["outputUrl"] = _signed_media_url(base, f"/video-version/{generation_id}/{version_id}", "video-version", str(generation_id), version_id)
++            if not state.get("thumbnailUrl") and state.get("thumbnailPath"):
++                state["thumbnailUrl"] = _signed_media_url(base, f"/thumbnail-version/{generation_id}/{version_id}", "thumbnail-version", str(generation_id), version_id)
+         return state
+ 
+     @service.get("/video/{job_id}")
+-    def video(job_id: str):
+-        # Test-only public playback endpoint. The video file lives in a Modal Volume,
+-        # not PostgreSQL or Cloudflare R2.
++    def video(job_id: str, token: str | None = None):
++        _require_media_token(token, "video", job_id)
+         output_cache.reload()
+-        path = Path(OUTPUT_ROOT) / f"{job_id}.mp4"
++        path = Path(OUTPUT_ROOT) / job_id / "master.mp4"
++        if not path.exists():
++            legacy = Path(OUTPUT_ROOT) / f"{job_id}.mp4"
++            path = legacy if legacy.exists() else path
+         if not path.exists():
+             raise HTTPException(status_code=404, detail="Video not found")
+-        return FileResponse(
+-            path,
+-            media_type="video/mp4",
+-            filename=f"triven-cinema-{job_id}.mp4",
+-            headers={"Cache-Control": "no-store"},
+-        )
++        return FileResponse(path, media_type="video/mp4", filename=f"triven-cinema-{job_id}.mp4", headers={"Cache-Control": "private, max-age=3600", "Access-Control-Allow-Origin": "*"})
++
++    @service.get("/thumbnail/{job_id}")
++    def thumbnail(job_id: str, token: str | None = None):
++        _require_media_token(token, "thumbnail", job_id)
++        output_cache.reload()
++        path = Path(OUTPUT_ROOT) / job_id / "thumbnail.jpg"
++        if not path.exists():
++            raise HTTPException(status_code=404, detail="Thumbnail not found")
++        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600", "Access-Control-Allow-Origin": "*"})
++
++    @service.get("/video-version/{generation_id}/{version_id}")
++    def video_version(generation_id: str, version_id: str, token: str | None = None):
++        _require_media_token(token, "video-version", generation_id, version_id)
++        output_cache.reload()
++        path = Path(OUTPUT_ROOT) / generation_id / "versions" / f"{version_id}.mp4"
++        if not path.exists():
++            raise HTTPException(status_code=404, detail="Edited video not found")
++        return FileResponse(path, media_type="video/mp4", filename=f"triven-cinema-{version_id}.mp4", headers={"Cache-Control": "private, max-age=3600", "Access-Control-Allow-Origin": "*"})
++
++    @service.get("/thumbnail-version/{generation_id}/{version_id}")
++    def thumbnail_version(generation_id: str, version_id: str, token: str | None = None):
++        _require_media_token(token, "thumbnail-version", generation_id, version_id)
++        output_cache.reload()
++        path = Path(OUTPUT_ROOT) / generation_id / "versions" / f"{version_id}.jpg"
++        if not path.exists():
++            raise HTTPException(status_code=404, detail="Edited thumbnail not found")
++        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600", "Access-Control-Allow-Origin": "*"})
+ 
+     return service
+diff --git a/next.config.ts b/next.config.ts
+index 8c80ff2..2552276 100644
+--- a/next.config.ts
++++ b/next.config.ts
+@@ -1,7 +1,20 @@
+ import type { NextConfig } from "next";
+ 
++const securityHeaders = [
++  { key: "X-Content-Type-Options", value: "nosniff" },
++  { key: "X-Frame-Options", value: "DENY" },
++  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
++  { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), payment=()" },
++  { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
++  { key: "X-DNS-Prefetch-Control", value: "off" },
++];
++
+ const nextConfig: NextConfig = {
+   serverExternalPackages: ["@prisma/client"],
++  poweredByHeader: false,
++  async headers() {
++    return [{ source: "/(.*)", headers: securityHeaders }];
++  },
+ };
+ 
+ export default nextConfig;
+diff --git a/package.json b/package.json
+index 5533927..f1f7490 100644
+--- a/package.json
++++ b/package.json
+@@ -11,7 +11,8 @@
+     "db:migrate": "prisma migrate dev",
+     "db:deploy": "prisma migrate deploy",
+     "db:push": "prisma db push",
+-    "db:studio": "prisma studio"
++    "db:studio": "prisma studio",
++    "check": "npm run lint && npm run build && python3 -m py_compile modal/cinema.py"
+   },
+   "dependencies": {
+     "@gradio/client": "^2.7.1",
+diff --git a/triven-patch-new/prisma/migrations/202610050001_production_core/migration.sql b/prisma/migrations/202610050001_production_core/migration.sql
+new file mode 100644
+index 0000000..bc65201
+--- /dev/null
++++ b/prisma/migrations/202610050001_production_core/migration.sql
+@@ -0,0 +1,54 @@
++ALTER TYPE "GenerationStatus" ADD VALUE IF NOT EXISTS 'ANALYZING';
++ALTER TYPE "GenerationStatus" ADD VALUE IF NOT EXISTS 'CANCEL_REQUESTED';
++ALTER TYPE "GenerationStatus" ADD VALUE IF NOT EXISTS 'CANCELLED';
++
++CREATE TYPE "VideoVersionStatus" AS ENUM ('QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED');
++
++ALTER TABLE "Generation"
++  ADD COLUMN "clientRequestId" TEXT,
++  ADD COLUMN "analysis" JSONB,
++  ADD COLUMN "qcReport" JSONB;
++
++ALTER TABLE "Scene" ADD COLUMN "metadata" JSONB;
++
++CREATE UNIQUE INDEX "Generation_clientRequestId_key" ON "Generation"("clientRequestId");
++
++CREATE TABLE "VideoVersion" (
++  "id" TEXT NOT NULL,
++  "generationId" TEXT NOT NULL,
++  "label" TEXT NOT NULL DEFAULT 'Edited version',
++  "status" "VideoVersionStatus" NOT NULL DEFAULT 'QUEUED',
++  "providerJobId" TEXT,
++  "outputUrl" TEXT,
++  "thumbnailUrl" TEXT,
++  "operations" JSONB NOT NULL,
++  "qcReport" JSONB,
++  "error" TEXT,
++  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  "updatedAt" TIMESTAMP(3) NOT NULL,
++  CONSTRAINT "VideoVersion_pkey" PRIMARY KEY ("id")
++);
++
++CREATE INDEX "VideoVersion_generationId_createdAt_idx" ON "VideoVersion"("generationId", "createdAt");
++CREATE INDEX "VideoVersion_status_idx" ON "VideoVersion"("status");
++
++CREATE TABLE "RenderAttempt" (
++  "id" TEXT NOT NULL,
++  "generationId" TEXT NOT NULL,
++  "providerJobId" TEXT,
++  "status" "GenerationStatus" NOT NULL DEFAULT 'QUEUED',
++  "error" TEXT,
++  "startedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++  "finishedAt" TIMESTAMP(3),
++  CONSTRAINT "RenderAttempt_pkey" PRIMARY KEY ("id")
++);
++
++CREATE INDEX "RenderAttempt_generationId_startedAt_idx" ON "RenderAttempt"("generationId", "startedAt");
++
++ALTER TABLE "VideoVersion"
++  ADD CONSTRAINT "VideoVersion_generationId_fkey"
++  FOREIGN KEY ("generationId") REFERENCES "Generation"("id") ON DELETE CASCADE ON UPDATE CASCADE;
++
++ALTER TABLE "RenderAttempt"
++  ADD CONSTRAINT "RenderAttempt_generationId_fkey"
++  FOREIGN KEY ("generationId") REFERENCES "Generation"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index b7712bc..5a37b64 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -13,6 +13,9 @@ enum GenerationStatus {
+   GENERATING
+   STITCHING
+   UPLOADING
++  ANALYZING
++  CANCEL_REQUESTED
++  CANCELLED
+   COMPLETED
+   FAILED
+ }
+@@ -22,8 +25,16 @@ enum GenerationMode {
+   SCENES
+ }
+ 
++enum VideoVersionStatus {
++  QUEUED
++  PROCESSING
++  COMPLETED
++  FAILED
++}
++
+ model Generation {
+   id              String           @id @default(cuid())
++  clientRequestId String?          @unique
+   prompt          String           @db.Text
+   enhancedPrompt  String?          @db.Text
+   mode            GenerationMode
+@@ -46,7 +57,11 @@ model Generation {
+   actualCost      Float?
+   error           String?          @db.Text
+   metadata        Json?
++  analysis        Json?
++  qcReport        Json?
+   scenes          Scene[]
++  versions        VideoVersion[]
++  attempts        RenderAttempt[]
+   createdAt       DateTime         @default(now())
+   updatedAt       DateTime         @updatedAt
+ 
+@@ -65,8 +80,41 @@ model Scene {
+   seed         Int?
+   status       GenerationStatus @default(QUEUED)
+   videoUrl     String?
++  metadata     Json?
+   createdAt    DateTime         @default(now())
+   updatedAt    DateTime         @updatedAt
+ 
+   @@unique([generationId, order])
+ }
++
++model VideoVersion {
++  id           String             @id @default(cuid())
++  generationId String
++  generation   Generation         @relation(fields: [generationId], references: [id], onDelete: Cascade)
++  label        String             @default("Edited version")
++  status       VideoVersionStatus @default(QUEUED)
++  providerJobId String?
++  outputUrl    String?
++  thumbnailUrl String?
++  operations   Json
++  qcReport     Json?
++  error        String?            @db.Text
++  createdAt    DateTime           @default(now())
++  updatedAt    DateTime           @updatedAt
++
++  @@index([generationId, createdAt])
++  @@index([status])
++}
++
++model RenderAttempt {
++  id           String           @id @default(cuid())
++  generationId String
++  generation   Generation       @relation(fields: [generationId], references: [id], onDelete: Cascade)
++  providerJobId String?
++  status       GenerationStatus @default(QUEUED)
++  error        String?          @db.Text
++  startedAt    DateTime         @default(now())
++  finishedAt   DateTime?
++
++  @@index([generationId, startedAt])
++}
+diff --git a/triven-patch-new/proxy.ts b/proxy.ts
+new file mode 100644
+index 0000000..72a4d62
+--- /dev/null
++++ b/proxy.ts
+@@ -0,0 +1,41 @@
++import type { NextRequest } from "next/server";
++import { NextResponse } from "next/server";
++
++function unauthorized() {
++  return new NextResponse("Authentication required", {
++    status: 401,
++    headers: {
++      "WWW-Authenticate": 'Basic realm="Triven Cinema", charset="UTF-8"',
++      "Cache-Control": "no-store",
++    },
++  });
++}
++
++export function proxy(request: NextRequest) {
++  const expectedUser = process.env.TRIVEN_BASIC_AUTH_USER;
++  const expectedPassword = process.env.TRIVEN_BASIC_AUTH_PASSWORD;
++
++  // Local development stays frictionless until both values are configured.
++  if (!expectedUser || !expectedPassword) return NextResponse.next();
++  if (request.nextUrl.pathname === "/api/health") return NextResponse.next();
++
++  const authorization = request.headers.get("authorization") || "";
++  if (!authorization.startsWith("Basic ")) return unauthorized();
++
++  try {
++    const decoded = atob(authorization.slice(6));
++    const split = decoded.indexOf(":");
++    if (split < 0) return unauthorized();
++    const user = decoded.slice(0, split);
++    const password = decoded.slice(split + 1);
++    if (user !== expectedUser || password !== expectedPassword) return unauthorized();
++  } catch {
++    return unauthorized();
++  }
++
++  return NextResponse.next();
++}
++
++export const config = {
++  matcher: ["/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)"],
++};

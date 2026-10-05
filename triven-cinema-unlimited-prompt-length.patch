@@ -1,0 +1,53 @@
+diff -ruN a/components/cinema/prompt-composer.tsx b/components/cinema/prompt-composer.tsx
+--- a/components/cinema/prompt-composer.tsx	2026-10-05 11:09:58.623695106 +0000
++++ b/components/cinema/prompt-composer.tsx	2026-10-05 11:09:59.415822370 +0000
+@@ -62,7 +62,7 @@
+     durationSeconds: duration,
+     audioQuality,
+   });
+-  const canSubmit = ready && !busy && prompt.trim().length >= 5 && prompt.trim().length <= 12000;
++  const canSubmit = ready && !busy && prompt.trim().length >= 5;
+   const hasPrompt = prompt.trim().length >= 5;
+ 
+   useEffect(() => {
+@@ -109,7 +109,6 @@
+           ref={textarea}
+           aria-label="Describe your video"
+           value={prompt}
+-          maxLength={12000}
+           rows={2}
+           placeholder={chatMode ? "Describe the next video you want to create..." : "Describe a scene, story, ad or idea..."}
+           onChange={(event) => setPrompt(event.target.value)}
+diff -ruN a/components/cinema/use-conversations.ts b/components/cinema/use-conversations.ts
+--- a/components/cinema/use-conversations.ts	2026-10-05 11:09:58.623733875 +0000
++++ b/components/cinema/use-conversations.ts	2026-10-05 11:09:59.416596344 +0000
+@@ -190,7 +190,7 @@
+ 
+   function submit(rawPrompt: string, original?: Turn, explicitSettings?: Turn["settings"]): boolean {
+     const prompt = rawPrompt.trim();
+-    if (!ready || prompt.length < 5 || prompt.length > 12000) return false;
++    if (!ready || prompt.length < 5) return false;
+     const chatId = activeId || crypto.randomUUID();
+     if (submitting.current.has(chatId) || conversations.find((chat) => chat.id === chatId)?.turns.some((turn) => isActive(turn.status))) return false;
+     submitting.current.add(chatId);
+diff -ruN a/lib/schemas.ts b/lib/schemas.ts
+--- a/lib/schemas.ts	2026-10-05 11:09:58.624168132 +0000
++++ b/lib/schemas.ts	2026-10-05 11:09:59.416813162 +0000
+@@ -15,7 +15,7 @@
+ });
+ 
+ export const planSchema = z.object({
+-  prompt: z.string().min(5).max(12000),
++  prompt: z.string().min(5),
+   durationSeconds: z.number().int().min(5).max(180).default(20),
+   aspectRatio: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
+ });
+@@ -30,7 +30,7 @@
+ 
+ export const generationSchema = z.object({
+   clientRequestId: z.string().min(8).max(100).optional(),
+-  prompt: z.string().min(5).max(12000),
++  prompt: z.string().min(5),
+   mode: z.enum(["DIRECT", "SCENES"]),
+   videoType: z.enum(["cartoon", "story", "cinematic", "product-ad", "explainer", "social"]).default("cinematic"),
+   model: z.literal("ltx-2.5").default("ltx-2.5"),

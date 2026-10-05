@@ -63,7 +63,7 @@ export default function CinemaStudio() {
           chatMode={chatMode}
           busy={busy}
           ready={ready}
-          onSubmit={(prompt, settings) => submit(prompt, undefined, settings)}
+          onSubmit={(prompt, settings, plan) => submit(prompt, undefined, settings, plan)}
           onStop={stopCurrentGeneration}
           editDraft={editDraft}
           onEditDraftApplied={() => setEditDraft(null)}

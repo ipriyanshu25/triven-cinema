@@ -1,65 +1,33 @@
-# START HERE
+# Start Here — Triven Cinema Production Upgrade
 
-## A. Run the complete app locally without GPU cost
+This package is an upgrade of the supplied Triven Cinema project. It keeps the working Next.js -> Modal -> B200 -> LTX-2.5 pipeline, then adds production planning, safer job control, technical QC and a non-destructive CPU video editor.
 
-```bash
-cp .env.example .env
-docker compose up -d db
-npm install
-npx prisma migrate deploy
-npm run dev
-```
+## Upgrade an existing local copy
 
-Open `http://localhost:3000`.
-
-Leave these values enabled for the first test:
-
-```env
-MOCK_MODE="true"
-NEXT_PUBLIC_MOCK_MODE="true"
-```
-
-The UI, Prisma database, storyboard API, generation history and result player will work using the included mock MP4.
-
-## B. Turn on real LTX-2.5 rendering
-
-1. Accept access to `Lightricks/LTX-2.5-Diffusers` on Hugging Face and create a read token.
-2. Create a Cloudflare R2 bucket and public/custom-domain URL.
-3. Install/authenticate Modal:
+Back up the current project first. Then copy these files in place or apply the included production patch.
 
 ```bash
-python3 -m pip install modal
-modal setup
-```
-
-4. Create the Modal runtime secret using the exact command template in `README.md`.
-5. Cache the model on CPU:
-
-```bash
-modal run modal/cinema.py::prefetch_models
-```
-
-6. Deploy the API:
-
-```bash
+npm ci
+npm run db:generate
+npm run db:deploy
+npm run lint
+npm run build
+python3 -m py_compile modal/cinema.py
 modal deploy modal/cinema.py
-```
-
-7. Copy the deployed Modal URL into `.env`, then change:
-
-```env
-MOCK_MODE="false"
-NEXT_PUBLIC_MOCK_MODE="false"
-MODAL_API_URL="https://YOUR-MODAL-ENDPOINT"
-MODAL_WEB_SECRET="YOUR_SHARED_SECRET"
-```
-
-8. Restart:
-
-```bash
 npm run dev
 ```
 
-9. First paid render: Direct / 16:9 / Preview / 5 seconds.
+The new Prisma migration is additive. Do **not** use `prisma db push` against production data.
 
-Read `README.md` for the full deployment, R2, database, architecture and troubleshooting guide.
+You do not need to re-prefetch LTX model weights unless the Modal model cache was deleted or you intentionally change the model assets.
+
+## First production smoke test
+
+1. Open `/api/health` and confirm database + Modal are healthy.
+2. Generate a 5-second Fast / 1080p / 24 FPS video.
+3. Stop a second render while it is queued/generating, then immediately start another one.
+4. Generate a 30–60 second multi-scene prompt and inspect **AI Director plan**.
+5. Confirm the completed video has **Technical QC**.
+6. Open **Video editor**, make a trim/color/audio edit, and confirm a new version is created without replacing the original.
+
+Read `PRODUCTION-PLAN.md` for what changed and `UPGRADE-CHECKLIST.md` before deployment.

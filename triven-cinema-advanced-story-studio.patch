@@ -1,0 +1,1102 @@
+diff --git a/ADVANCED-STORY-STUDIO.md b/ADVANCED-STORY-STUDIO.md
+new file mode 100644
+index 0000000..9b36dd2
+--- /dev/null
++++ b/ADVANCED-STORY-STUDIO.md
+@@ -0,0 +1,35 @@
++# Triven Cinema — Advanced Story Studio
++
++This upgrade adds a scene-first creation workflow on top of the production foundation.
++
++## What is implemented
++
++- Quick creation formats: Reel / Short, Story Film, Cartoon, Cinematic, Product Ad, Explainer.
++- Explicit Build mode: Auto, Single shot, Scenes.
++- Scene continuity modes:
++  - Strict — carries the previous rendered frame into the next scene through LTX image-to-video and repeats the immutable character/world memory.
++  - Balanced — uses the previous-frame bridge only when the director marks the next scene as continuous.
++  - Creative — scene prompts share the story bible, but visual frame bridging is disabled.
++- Scene Studio before generation:
++  - plan scenes from a master prompt;
++  - edit title, duration and scene prompt;
++  - reorder, add and remove scenes;
++  - inspect character lock, world lock and previous-scene memory.
++- Director memory per scene:
++  - immutable character descriptors;
++  - world/style descriptors;
++  - previous-scene state summary;
++  - carry-forward constraints;
++  - allowed changes for the current scene.
++- LTX continuity bridge:
++  - extracts the final frame of a rendered scene;
++  - reuses it as image conditioning for the next compatible scene;
++  - shares the loaded LTX components with `LTX2ImageToVideoPipeline` rather than loading a second copy of the model weights.
++
++## Why this helps
++
++Text-only generation cannot guarantee identical characters across separately sampled clips. The Story Studio now combines semantic memory in every scene prompt with visual continuity from the previous rendered frame. Story and Cartoon default to Strict memory; other formats default to Balanced memory.
++
++## Next production layer
++
++For still stronger cross-location identity consistency, add user-uploaded character references and an Ingredients/reference-sheet IC-LoRA workflow behind a feature flag. Add pose/depth/motion controls only through workflows validated for the deployed LTX version. For transcript-perfect dialogue, use a dedicated TTS/dialogue track and a validated lip-sync/dubbing workflow rather than relying on native generative speech alone.
+diff --git a/app/api/generations/route.ts b/app/api/generations/route.ts
+index 30b86c9..928f2f7 100644
+--- a/app/api/generations/route.ts
++++ b/app/api/generations/route.ts
+@@ -115,6 +115,7 @@ export async function POST(request: Request) {
+           resolution: input.resolution,
+           fps: input.fps,
+           audioQuality: input.audioQuality,
++          continuityMode: input.continuityMode,
+           mockMode: MOCK_MODE,
+           profileClipLimitSeconds: clipLimit(input.renderMode, input.resolution, input.fps),
+         },
+@@ -133,6 +134,7 @@ export async function POST(request: Request) {
+               dialogue: scene.dialogue || null,
+               transition: scene.transition || null,
+               mustHave: scene.mustHave || [],
++              memory: scene.memory || null,
+             },
+           })),
+         } : undefined,
+@@ -162,6 +164,7 @@ export async function POST(request: Request) {
+         audioQuality: input.audioQuality,
+         durationSeconds: input.durationSeconds,
+         nativeAudio,
++        continuityMode: input.continuityMode,
+         seed,
+         scenes: input.mode === "SCENES" ? normalizedScenes?.map((scene) => ({
+           ...scene,
+diff --git a/app/api/plan/route.ts b/app/api/plan/route.ts
+index 1209548..b732966 100644
+--- a/app/api/plan/route.ts
++++ b/app/api/plan/route.ts
+@@ -5,7 +5,7 @@ import { planSchema } from "@/lib/schemas";
+ export async function POST(request: Request) {
+   try {
+     const input = planSchema.parse(await request.json());
+-    const plan = await planScenes(input.prompt, input.durationSeconds, input.aspectRatio);
++    const plan = await planScenes(input.prompt, input.durationSeconds, input.aspectRatio, input.continuityMode, input.videoType);
+     return NextResponse.json(plan);
+   } catch (error) {
+     return NextResponse.json({ error: error instanceof Error ? error.message : "Invalid request" }, { status: 400 });
+diff --git a/app/globals.css b/app/globals.css
+index c5674aa..5d62daa 100644
+--- a/app/globals.css
++++ b/app/globals.css
+@@ -805,3 +805,96 @@ button { transition: background .18s, color .18s, opacity .18s, transform .18s,
+   .secondaryEditButton,
+   .primaryEditButton { width: 100%; }
+ }
++
++/* Advanced story studio */
++.creationPresetStrip {
++  width: min(1160px, calc(100% - 32px));
++  margin: 0 auto 10px;
++  display: grid;
++  grid-template-columns: repeat(6, minmax(0, 1fr));
++  gap: 8px;
++}
++.creationPresetStrip button {
++  min-width: 0;
++  border: 1px solid #2d2f35;
++  background: #17181c;
++  color: #f7f7f8;
++  border-radius: 12px;
++  padding: 10px 12px;
++  text-align: left;
++  cursor: pointer;
++}
++.creationPresetStrip button:hover { background: #202126; border-color: #474a52; }
++.creationPresetStrip strong { display: block; font-size: 12px; line-height: 1.3; }
++.creationPresetStrip span { display: block; margin-top: 3px; font-size: 10px; color: #9da1aa; line-height: 1.35; }
++.planScenesButton {
++  min-height: 44px;
++  padding: 0 14px;
++  border-radius: 10px;
++  border: 1px solid #3f424b;
++  background: #24262c;
++  color: #fff;
++  font-size: 12px;
++  font-weight: 650;
++  cursor: pointer;
++}
++.planScenesButton:hover:not(:disabled) { background: #2d3037; }
++.planScenesButton:disabled { opacity: .45; cursor: default; }
++.scenePlanError { width: min(1160px, calc(100% - 32px)); margin: 8px auto 0; color: #ffb9b9; font-size: 12px; }
++.sceneBuilder {
++  width: min(1160px, calc(100% - 32px));
++  max-height: min(52vh, 620px);
++  overflow: auto;
++  margin: 10px auto 0;
++  border: 1px solid #30323a;
++  background: #141519;
++  border-radius: 16px;
++  padding: 14px;
++  box-shadow: 0 18px 50px #00000055;
++}
++.sceneBuilderHead { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 12px; }
++.sceneBuilderHead > div { min-width: 0; }
++.sceneBuilderEyebrow { display: block; color: #8e93a0; font-size: 10px; font-weight: 750; letter-spacing: .12em; margin-bottom: 5px; }
++.sceneBuilderHead strong { display: block; color: #fff; font-size: 15px; }
++.sceneBuilderHead p, .sceneMemoryBanner p { color: #a7aab2; font-size: 11px; line-height: 1.45; margin: 4px 0 0; }
++.sceneClose, .addSceneButton, .sceneReorder button {
++  border: 1px solid #343741;
++  background: #202228;
++  color: #e9eaf0;
++  border-radius: 8px;
++  cursor: pointer;
++}
++.sceneClose { padding: 7px 10px; }
++.sceneMemoryBanner { border: 1px solid #2a2d34; background: #1b1d22; border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; }
++.sceneMemoryBanner strong { color: #e9eaf0; font-size: 11px; }
++.sceneEditorList { display: grid; gap: 10px; }
++.sceneEditorCard { border: 1px solid #292b32; background: #191a1f; border-radius: 12px; padding: 10px; }
++.sceneEditorTop { display: grid; grid-template-columns: 36px minmax(160px, 1fr) 76px auto; gap: 8px; align-items: center; }
++.sceneNumber { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 8px; background: #25272d; color: #cfd2da; font-size: 11px; font-weight: 750; }
++.sceneEditorTop > input, .sceneEditorTop label input, .sceneEditorCard > textarea {
++  border: 1px solid #30333a;
++  background: #101115;
++  color: #f6f7f8;
++  border-radius: 8px;
++  outline: none;
++}
++.sceneEditorTop > input { height: 34px; padding: 0 10px; font-weight: 650; }
++.sceneEditorTop label { display: flex; align-items: center; gap: 6px; color: #858a95; font-size: 10px; }
++.sceneEditorTop label input { width: 48px; height: 34px; padding: 0 6px; }
++.sceneReorder { display: flex; gap: 4px; }
++.sceneReorder button { min-height: 30px; padding: 0 8px; font-size: 10px; }
++.sceneReorder button:disabled { opacity: .35; cursor: default; }
++.sceneEditorCard > textarea { width: 100%; min-height: 94px; resize: vertical; padding: 9px 10px; margin-top: 8px; font: inherit; font-size: 11px; line-height: 1.5; }
++.sceneMemoryGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 8px; }
++.sceneMemoryGrid > div { border: 1px solid #272930; border-radius: 8px; padding: 8px; background: #15161a; }
++.sceneMemoryGrid span { display: block; color: #7f8490; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
++.sceneMemoryGrid p { margin: 3px 0 0; color: #c4c7ce; font-size: 10px; line-height: 1.4; }
++.addSceneButton { margin-top: 10px; padding: 8px 12px; font-weight: 650; font-size: 11px; }
++@media (max-width: 980px) { .creationPresetStrip { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
++@media (max-width: 720px) {
++  .creationPresetStrip { grid-template-columns: repeat(2, minmax(0, 1fr)); width: calc(100% - 20px); }
++  .sceneBuilder { width: calc(100% - 20px); }
++  .sceneEditorTop { grid-template-columns: 32px 1fr 70px; }
++  .sceneReorder { grid-column: 2 / -1; }
++  .sceneMemoryGrid { grid-template-columns: 1fr; }
++}
+diff --git a/components/cinema-studio.tsx b/components/cinema-studio.tsx
+index 654ab63..944bce6 100644
+--- a/components/cinema-studio.tsx
++++ b/components/cinema-studio.tsx
+@@ -63,7 +63,7 @@ export default function CinemaStudio() {
+           chatMode={chatMode}
+           busy={busy}
+           ready={ready}
+-          onSubmit={(prompt, settings) => submit(prompt, undefined, settings)}
++          onSubmit={(prompt, settings, plan) => submit(prompt, undefined, settings, plan)}
+           onStop={stopCurrentGeneration}
+           editDraft={editDraft}
+           onEditDraftApplied={() => setEditDraft(null)}
+diff --git a/components/cinema/chat-model.ts b/components/cinema/chat-model.ts
+index a5d9829..133c1f1 100644
+--- a/components/cinema/chat-model.ts
++++ b/components/cinema/chat-model.ts
+@@ -1,6 +1,7 @@
+ import type {
+   AspectRatio,
+   AudioQuality,
++  ContinuityMode,
+   FrameRate,
+   ProductionBrief,
+   QCReport,
+@@ -24,6 +25,7 @@ export type PromptSettings = {
+   durationSeconds: number;
+   videoType: VideoType;
+   nativeAudio: boolean;
++  continuityMode: ContinuityMode;
+ };
+ 
+ export type PromptOverrides = {
+@@ -36,6 +38,8 @@ export type PromptOverrides = {
+   audioQuality?: AudioQuality | "auto";
+   durationSeconds?: number | "auto";
+   nativeAudio?: boolean;
++  mode?: "DIRECT" | "SCENES" | "auto";
++  continuityMode?: ContinuityMode | "auto";
+ };
+ 
+ function clamp(value: number, min: number, max: number) {
+@@ -166,10 +170,13 @@ export function inferPromptSettings(prompt: string, overrides: PromptOverrides =
+ 
+   const hasExplicitScenes = /(?:^|\n)\s*(?:#{1,6}\s*)?SCENE\s+\d+/im.test(normalized);
+   const clipLimit = maxSingleClipSeconds(renderMode, resolution, fps);
+-  const mode: "DIRECT" | "SCENES" = hasExplicitScenes || durationSeconds > clipLimit || (videoType === "story" && durationSeconds > 10) ? "SCENES" : "DIRECT";
++  const inferredMode: "DIRECT" | "SCENES" = hasExplicitScenes || durationSeconds > clipLimit || (videoType === "story" && durationSeconds > 10) || (videoType === "cartoon" && durationSeconds > 10) ? "SCENES" : "DIRECT";
++  const mode = overrides.mode && overrides.mode !== "auto" ? overrides.mode : inferredMode;
++  const inferredContinuity: ContinuityMode = videoType === "story" || videoType === "cartoon" ? "strict" : "balanced";
++  const continuityMode = overrides.continuityMode && overrides.continuityMode !== "auto" ? overrides.continuityMode : inferredContinuity;
+   const quality = overrides.quality && overrides.quality !== "auto" ? overrides.quality : legacyQualityForResolution(resolution);
+ 
+-  return { mode, aspectRatio, quality, renderMode, resolution, fps, audioQuality, durationSeconds, videoType, nativeAudio };
++  return { mode, aspectRatio, quality, renderMode, resolution, fps, audioQuality, durationSeconds, videoType, nativeAudio, continuityMode };
+ }
+ 
+ export function statusLabel(status?: string) {
+@@ -190,7 +197,7 @@ export function statusLabel(status?: string) {
+   }
+ }
+ 
+-export type Generation = Omit<PromptSettings, "videoType" | "quality" | "renderMode" | "resolution" | "fps" | "audioQuality"> & {
++export type Generation = Omit<PromptSettings, "videoType" | "quality" | "renderMode" | "resolution" | "fps" | "audioQuality" | "continuityMode"> & {
+   quality: StoredQuality;
+   id: string;
+   clientRequestId?: string | null;
+@@ -217,6 +224,7 @@ export type Generation = Omit<PromptSettings, "videoType" | "quality" | "renderM
+     resolution?: Resolution | null;
+     fps?: FrameRate | null;
+     audioQuality?: AudioQuality | null;
++    continuityMode?: ContinuityMode | null;
+   };
+ };
+ 
+@@ -252,6 +260,7 @@ export function turnFromJob(job: Generation): Turn {
+   const resolution = job.metadata?.resolution || inferred.resolution;
+   const fps = job.metadata?.fps || inferred.fps;
+   const audioQuality = job.metadata?.audioQuality || (job.nativeAudio ? "standard" : "off");
++  const continuityMode = job.metadata?.continuityMode || inferred.continuityMode;
+   const settings: PromptSettings = {
+     mode: job.mode,
+     aspectRatio: job.aspectRatio,
+@@ -263,6 +272,7 @@ export function turnFromJob(job: Generation): Turn {
+     durationSeconds: job.durationSeconds,
+     nativeAudio: audioQuality !== "off" && job.nativeAudio,
+     videoType: job.videoType || job.metadata?.videoType || inferred.videoType,
++    continuityMode,
+   };
+   return { id: job.id, prompt: job.prompt, settings, status: turnStatusFromJob(job), job };
+ }
+diff --git a/components/cinema/generation-message.tsx b/components/cinema/generation-message.tsx
+index 24ddf22..5170591 100644
+--- a/components/cinema/generation-message.tsx
++++ b/components/cinema/generation-message.tsx
+@@ -59,6 +59,7 @@ export function GenerationMessage({ turn, busy, onRegenerate, onEdit }: { turn:
+       <div className="generationSpecs" aria-label="Generation settings">
+         <span>{videoTypeLabel(videoType)}</span>
+         <span>{turn.settings.mode === "SCENES" ? "Multi-scene" : "Single scene"}</span>
++        {turn.settings.mode === "SCENES" && <span>{turn.settings.continuityMode === "strict" ? "Strict memory" : turn.settings.continuityMode === "creative" ? "Creative continuity" : "Balanced memory"}</span>}
+         <span>{turn.settings.durationSeconds}s</span>
+         <span>{aspectRatio}</span>
+         <span>{renderModeLabel(turn.settings.renderMode)} mode</span>
+diff --git a/components/cinema/prompt-composer.tsx b/components/cinema/prompt-composer.tsx
+index a18eee0..332c3e2 100644
+--- a/components/cinema/prompt-composer.tsx
++++ b/components/cinema/prompt-composer.tsx
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ import { useEffect, useRef, useState } from "react";
+-import type { AspectRatio, AudioQuality, FrameRate, RenderMode, Resolution, VideoType } from "@/lib/types";
++import type { AspectRatio, AudioQuality, ContinuityMode, FrameRate, RenderMode, Resolution, ScenePlan, VideoType } from "@/lib/types";
+ import {
+   audioQualityLabel,
+   inferPromptSettings,
+@@ -11,6 +11,7 @@ import {
+   type PromptSettings,
+ } from "./chat-model";
+ import { Icon } from "./icons";
++import { SceneBuilder } from "./scene-builder";
+ 
+ type VideoTypeSelection = VideoType | "auto";
+ type AspectSelection = AspectRatio | "auto";
+@@ -19,6 +20,8 @@ type ResolutionSelection = Resolution | "auto";
+ type FpsSelection = FrameRate | "auto";
+ type AudioSelection = AudioQuality | "auto";
+ type DurationSelection = 5 | 10 | 15 | 30 | 60 | 90 | 120 | 180 | "auto";
++type BuildSelection = "auto" | "DIRECT" | "SCENES";
++type ContinuitySelection = ContinuityMode | "auto";
+ 
+ export type ComposerEditDraft = {
+   id: string;
+@@ -26,6 +29,15 @@ export type ComposerEditDraft = {
+   settings: PromptSettings;
+ };
+ 
++const CREATION_PRESETS: { id: string; label: string; detail: string; videoType: VideoType; aspect: AspectRatio; duration: DurationSelection; build: BuildSelection; continuity: ContinuitySelection }[] = [
++  { id: "reel", label: "Reel / Short", detail: "Hook → beats → payoff", videoType: "social", aspect: "9:16", duration: 30, build: "SCENES", continuity: "balanced" },
++  { id: "story", label: "Story Film", detail: "Setup → conflict → ending", videoType: "story", aspect: "16:9", duration: 60, build: "SCENES", continuity: "strict" },
++  { id: "cartoon", label: "Cartoon", detail: "Character-safe scene memory", videoType: "cartoon", aspect: "16:9", duration: 60, build: "SCENES", continuity: "strict" },
++  { id: "cinematic", label: "Cinematic", detail: "Premium visual sequence", videoType: "cinematic", aspect: "16:9", duration: 15, build: "auto", continuity: "balanced" },
++  { id: "product", label: "Product Ad", detail: "Problem → proof → CTA", videoType: "product-ad", aspect: "9:16", duration: 30, build: "SCENES", continuity: "balanced" },
++  { id: "explainer", label: "Explainer", detail: "Clear step-by-step story", videoType: "explainer", aspect: "16:9", duration: 60, build: "SCENES", continuity: "balanced" },
++];
++
+ export function PromptComposer({
+   chatMode,
+   busy,
+@@ -38,7 +50,7 @@ export function PromptComposer({
+   chatMode: boolean;
+   busy: boolean;
+   ready: boolean;
+-  onSubmit: (prompt: string, settings: PromptSettings) => boolean;
++  onSubmit: (prompt: string, settings: PromptSettings, plan?: ScenePlan) => boolean;
+   onStop: () => void;
+   editDraft?: ComposerEditDraft | null;
+   onEditDraftApplied?: () => void;
+@@ -51,6 +63,11 @@ export function PromptComposer({
+   const [fps, setFps] = useState<FpsSelection>("auto");
+   const [duration, setDuration] = useState<DurationSelection>("auto");
+   const [audioQuality, setAudioQuality] = useState<AudioSelection>("auto");
++  const [buildMode, setBuildMode] = useState<BuildSelection>("auto");
++  const [continuityMode, setContinuityMode] = useState<ContinuitySelection>("auto");
++  const [scenePlan, setScenePlan] = useState<ScenePlan | null>(null);
++  const [planning, setPlanning] = useState(false);
++  const [planError, setPlanError] = useState("");
+   const textarea = useRef<HTMLTextAreaElement>(null);
+ 
+   const settings = inferPromptSettings(prompt, {
+@@ -61,6 +78,8 @@ export function PromptComposer({
+     fps,
+     durationSeconds: duration,
+     audioQuality,
++    mode: buildMode,
++    continuityMode,
+   });
+   const canSubmit = ready && !busy && prompt.trim().length >= 5 && prompt.trim().length <= 12000;
+   const hasPrompt = prompt.trim().length >= 5;
+@@ -74,7 +93,6 @@ export function PromptComposer({
+ 
+   useEffect(() => {
+     if (!editDraft) return;
+-
+     const applyTimer = window.setTimeout(() => {
+       setPrompt(editDraft.prompt);
+       setVideoType(editDraft.settings.videoType);
+@@ -84,25 +102,74 @@ export function PromptComposer({
+       setFps(editDraft.settings.fps);
+       setDuration([5, 10, 15, 30, 60, 90, 120, 180].includes(editDraft.settings.durationSeconds) ? editDraft.settings.durationSeconds as DurationSelection : "auto");
+       setAudioQuality(editDraft.settings.audioQuality);
++      setBuildMode(editDraft.settings.mode);
++      setContinuityMode(editDraft.settings.continuityMode);
++      setScenePlan(null);
+       onEditDraftApplied?.();
+-
+       window.requestAnimationFrame(() => {
+         textarea.current?.focus();
+         textarea.current?.setSelectionRange(editDraft.prompt.length, editDraft.prompt.length);
+       });
+     }, 0);
+-
+     return () => window.clearTimeout(applyTimer);
+   }, [editDraft, onEditDraftApplied]);
+ 
++  function invalidatePlan() {
++    if (scenePlan) setScenePlan(null);
++    if (planError) setPlanError("");
++  }
++
++  function applyPreset(id: string) {
++    const preset = CREATION_PRESETS.find((item) => item.id === id);
++    if (!preset) return;
++    setVideoType(preset.videoType);
++    setAspectRatio(preset.aspect);
++    setDuration(preset.duration);
++    setBuildMode(preset.build);
++    setContinuityMode(preset.continuity);
++    invalidatePlan();
++    textarea.current?.focus();
++  }
++
++  async function planScenes() {
++    if (!hasPrompt || planning) return;
++    setPlanning(true);
++    setPlanError("");
++    try {
++      const response = await fetch("/api/plan", {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({
++          prompt: prompt.trim(),
++          durationSeconds: settings.durationSeconds,
++          aspectRatio: settings.aspectRatio,
++          videoType: settings.videoType,
++          continuityMode: settings.continuityMode,
++        }),
++      });
++      const payload = await response.json();
++      if (!response.ok || !payload?.scenes?.length) throw new Error(payload?.error || "Could not plan scenes");
++      setScenePlan(payload as ScenePlan);
++    } catch (error) {
++      setPlanError(error instanceof Error ? error.message : "Could not plan scenes");
++    } finally {
++      setPlanning(false);
++    }
++  }
++
+   function send() {
+-    if (canSubmit && onSubmit(prompt, settings)) {
++    if (canSubmit && onSubmit(prompt, settings, settings.mode === "SCENES" ? scenePlan || undefined : undefined)) {
+       setPrompt("");
++      setScenePlan(null);
+       textarea.current?.focus();
+     }
+   }
+ 
+   return <div className={`composerDock ${chatMode ? "chatDock" : ""}`}>
++    {!chatMode && <div className="creationPresetStrip" aria-label="Video creation formats">
++      {CREATION_PRESETS.map((preset) => <button type="button" key={preset.id} onClick={() => applyPreset(preset.id)}><strong>{preset.label}</strong><span>{preset.detail}</span></button>)}
++    </div>}
++
+     <form className="composer" onSubmit={(event) => { event.preventDefault(); send(); }}>
+       <div className="composerInputWrap">
+         <textarea
+@@ -111,8 +178,8 @@ export function PromptComposer({
+           value={prompt}
+           maxLength={12000}
+           rows={2}
+-          placeholder={chatMode ? "Describe the next video you want to create..." : "Describe a scene, story, ad or idea..."}
+-          onChange={(event) => setPrompt(event.target.value)}
++          placeholder={chatMode ? "Describe the next video you want to create..." : "Describe your story, reel, cartoon, ad, scene or cinematic idea..."}
++          onChange={(event) => { setPrompt(event.target.value); invalidatePlan(); }}
+           onKeyDown={(event) => {
+             if (!event.nativeEvent.isComposing && (event.metaKey || event.ctrlKey) && event.key === "Enter") {
+               event.preventDefault();
+@@ -123,132 +190,46 @@ export function PromptComposer({
+       </div>
+ 
+       {hasPrompt && <div className="composerDetection" aria-live="polite">
+-        <span className="detectionLabel">Detected</span>
+-        <strong>{videoTypeLabel(settings.videoType)}</strong>
+-        <span>-</span>
+-        <span>{settings.mode === "SCENES" ? "Multi-scene" : "Single scene"}</span>
+-        <span>-</span>
+-        <span>{renderModeLabel(settings.renderMode)}</span>
+-        <span>-</span>
+-        <span>{outputResolution(settings.aspectRatio, settings.resolution)}</span>
+-        <span>-</span>
+-        <span>{settings.fps} FPS</span>
+-        <span>-</span>
+-        <span>{settings.durationSeconds}s</span>
+-        <span>-</span>
+-        <span>{audioQualityLabel(settings.audioQuality)}</span>
++        <span className="detectionLabel">Director</span>
++        <strong>{videoTypeLabel(settings.videoType)}</strong><span>-</span>
++        <span>{settings.mode === "SCENES" ? `${scenePlan?.scenes.length || "Auto"} scenes` : "Single shot"}</span><span>-</span>
++        <span>{settings.continuityMode === "strict" ? "Strict memory" : settings.continuityMode === "creative" ? "Creative continuity" : "Balanced memory"}</span><span>-</span>
++        <span>{renderModeLabel(settings.renderMode)}</span><span>-</span>
++        <span>{outputResolution(settings.aspectRatio, settings.resolution)}</span><span>-</span>
++        <span>{settings.fps} FPS</span><span>-</span><span>{settings.durationSeconds}s</span><span>-</span><span>{audioQualityLabel(settings.audioQuality)}</span>
+       </div>}
+ 
+       <div className="composerControls" aria-label="Video generation settings">
+-        <label className="composerControl wideControl">
+-          <span>Video type</span>
+-          <select value={videoType} onChange={(event) => setVideoType(event.target.value as VideoTypeSelection)} aria-label="Video type">
+-            <option value="auto">Auto</option>
+-            <option value="cartoon">Cartoon / Animation</option>
+-            <option value="story">Story</option>
+-            <option value="cinematic">Cinematic</option>
+-            <option value="product-ad">Product Ad</option>
+-            <option value="explainer">Explainer</option>
+-            <option value="social">Social Video</option>
+-          </select>
+-        </label>
+-
+-        <label className="composerControl compactControl">
+-          <span>Frame</span>
+-          <select value={aspectRatio} onChange={(event) => setAspectRatio(event.target.value as AspectSelection)} aria-label="Aspect ratio">
+-            <option value="auto">Auto</option>
+-            <option value="16:9">16:9</option>
+-            <option value="9:16">9:16</option>
+-            <option value="1:1">1:1</option>
+-          </select>
+-        </label>
+-
+-        <label className="composerControl">
+-          <span>Mode</span>
+-          <select value={renderMode} onChange={(event) => setRenderMode(event.target.value as RenderModeSelection)} aria-label="LTX render mode">
+-            <option value="auto">Auto</option>
+-            <option value="fast">Fast - Distilled</option>
+-            <option value="pro">Pro - Full / SFT</option>
+-          </select>
+-        </label>
+-
+-        <label className="composerControl">
+-          <span>Resolution</span>
+-          <select value={resolution} onChange={(event) => setResolution(event.target.value as ResolutionSelection)} aria-label="Video resolution">
+-            <option value="auto">Auto</option>
+-            <option value="720p">720p</option>
+-            <option value="1080p">1080p</option>
+-            <option value="1440p">1440p</option>
+-            <option value="4k">4K</option>
+-          </select>
+-        </label>
+-
+-        <label className="composerControl compactControl">
+-          <span>FPS</span>
+-          <select
+-            value={fps}
+-            onChange={(event) => setFps(event.target.value === "auto" ? "auto" : Number(event.target.value) as FrameRate)}
+-            aria-label="Frames per second"
+-          >
+-            <option value="auto">Auto</option>
+-            <option value="24">24 FPS</option>
+-            <option value="25">25 FPS</option>
+-            <option value="30">30 FPS (experimental)</option>
+-            <option value="48">48 FPS</option>
+-            <option value="50">50 FPS</option>
+-          </select>
+-        </label>
+-
+-        <label className="composerControl compactControl">
+-          <span>Duration</span>
+-          <select
+-            value={duration}
+-            onChange={(event) => setDuration(event.target.value === "auto" ? "auto" : Number(event.target.value) as DurationSelection)}
+-            aria-label="Video duration"
+-          >
+-            <option value="auto">Auto</option>
+-            <option value="5">5 sec</option>
+-            <option value="10">10 sec</option>
+-            <option value="15">15 sec</option>
+-            <option value="30">30 sec</option>
+-            <option value="60">60 sec</option>
+-            <option value="90">90 sec</option>
+-            <option value="120">2 min</option>
+-            <option value="180">3 min</option>
+-          </select>
+-        </label>
+-
+-        <label className="composerControl audioControl">
+-          <span>Audio</span>
+-          <select value={audioQuality} onChange={(event) => setAudioQuality(event.target.value as AudioSelection)} aria-label="Audio quality">
+-            <option value="auto">Auto</option>
+-            <option value="off">Off</option>
+-            <option value="standard">Native</option>
+-            <option value="high">Native HQ</option>
+-          </select>
+-        </label>
++        <label className="composerControl wideControl"><span>Video type</span><select value={videoType} onChange={(event) => { setVideoType(event.target.value as VideoTypeSelection); invalidatePlan(); }} aria-label="Video type">
++          <option value="auto">Auto</option><option value="cartoon">Cartoon / Animation</option><option value="story">Story</option><option value="cinematic">Cinematic</option><option value="product-ad">Product Ad</option><option value="explainer">Explainer</option><option value="social">Reel / Social</option>
++        </select></label>
++
++        <label className="composerControl"><span>Build</span><select value={buildMode} onChange={(event) => { setBuildMode(event.target.value as BuildSelection); invalidatePlan(); }} aria-label="Build mode">
++          <option value="auto">Auto</option><option value="DIRECT">Single shot</option><option value="SCENES">Scenes</option>
++        </select></label>
+ 
++        <label className="composerControl"><span>Memory</span><select value={continuityMode} onChange={(event) => { setContinuityMode(event.target.value as ContinuitySelection); invalidatePlan(); }} aria-label="Scene continuity memory">
++          <option value="auto">Auto</option><option value="strict">Strict</option><option value="balanced">Balanced</option><option value="creative">Creative</option>
++        </select></label>
++
++        <label className="composerControl compactControl"><span>Frame</span><select value={aspectRatio} onChange={(event) => { setAspectRatio(event.target.value as AspectSelection); invalidatePlan(); }} aria-label="Aspect ratio"><option value="auto">Auto</option><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option></select></label>
++
++        <label className="composerControl"><span>Mode</span><select value={renderMode} onChange={(event) => setRenderMode(event.target.value as RenderModeSelection)} aria-label="LTX render mode"><option value="auto">Auto</option><option value="fast">Fast - Distilled</option><option value="pro">Pro - Full / SFT</option></select></label>
++        <label className="composerControl"><span>Resolution</span><select value={resolution} onChange={(event) => setResolution(event.target.value as ResolutionSelection)} aria-label="Video resolution"><option value="auto">Auto</option><option value="720p">720p</option><option value="1080p">1080p</option><option value="1440p">1440p</option><option value="4k">4K</option></select></label>
++        <label className="composerControl compactControl"><span>FPS</span><select value={fps} onChange={(event) => setFps(event.target.value === "auto" ? "auto" : Number(event.target.value) as FrameRate)} aria-label="Frames per second"><option value="auto">Auto</option><option value="24">24 FPS</option><option value="25">25 FPS</option><option value="30">30 FPS (experimental)</option><option value="48">48 FPS</option><option value="50">50 FPS</option></select></label>
++        <label className="composerControl compactControl"><span>Duration</span><select value={duration} onChange={(event) => { setDuration(event.target.value === "auto" ? "auto" : Number(event.target.value) as DurationSelection); invalidatePlan(); }} aria-label="Video duration"><option value="auto">Auto</option><option value="5">5 sec</option><option value="10">10 sec</option><option value="15">15 sec</option><option value="30">30 sec</option><option value="60">60 sec</option><option value="90">90 sec</option><option value="120">2 min</option><option value="180">3 min</option></select></label>
++        <label className="composerControl audioControl"><span>Audio</span><select value={audioQuality} onChange={(event) => setAudioQuality(event.target.value as AudioSelection)} aria-label="Audio quality"><option value="auto">Auto</option><option value="off">Off</option><option value="standard">Native</option><option value="high">Native HQ</option></select></label>
++
++        {settings.mode === "SCENES" && <button className="planScenesButton" type="button" disabled={!hasPrompt || planning || busy} onClick={() => void planScenes()}>{planning ? "Planning..." : scenePlan ? "Re-plan scenes" : "Plan scenes"}</button>}
+         <div className="composerSpacer" />
+         <div className="composerEngine" title="Video model"><Icon name="film" size={15} /><span>LTX-2.5 {renderModeLabel(settings.renderMode)}</span></div>
+-        <button
+-          className={`sendButton ${busy ? "stopGenerationButton" : ""}`}
+-          type={busy ? "button" : "submit"}
+-          disabled={busy ? !ready : !canSubmit}
+-          aria-label={busy ? "Stop generation" : "Generate video"}
+-          title={busy ? "Stop generation" : "Generate video (Cmd / Ctrl + Enter)"}
+-          onClick={busy ? onStop : undefined}
+-        ><Icon name={busy ? "pause" : "arrow"} /></button>
++        <button className={`sendButton ${busy ? "stopGenerationButton" : ""}`} type={busy ? "button" : "submit"} disabled={busy ? !ready : !canSubmit} aria-label={busy ? "Stop generation" : "Generate video"} title={busy ? "Stop generation" : "Generate video (Cmd / Ctrl + Enter)"} onClick={busy ? onStop : undefined}><Icon name={busy ? "pause" : "arrow"} /></button>
+       </div>
+     </form>
+ 
+-    <p className="composerHint">
+-      {!ready
+-        ? "Loading your workspace..."
+-        : busy
+-          ? "Your video is rendering. Use the pause button to stop this render, then edit the prompt or generate again."
+-          : prompt.length > 0 && prompt.trim().length < 5
+-            ? "Add a little more detail - at least 5 characters."
+-            : "Choose Fast or Pro, resolution, FPS and native audio. Auto can infer them from your prompt."}
+-    </p>
++    {planError && <p className="scenePlanError" role="status">{planError}</p>}
++    {scenePlan && settings.mode === "SCENES" && <SceneBuilder plan={scenePlan} onChange={setScenePlan} onClose={() => setScenePlan(null)} />}
++
++    <p className="composerHint">{!ready ? "Loading your workspace..." : busy ? "Your video is rendering. Use the pause button to stop this render, then edit the prompt or generate again." : prompt.length > 0 && prompt.trim().length < 5 ? "Add a little more detail - at least 5 characters." : settings.mode === "SCENES" ? "Scene mode keeps a continuity memory for recurring characters and can bridge the previous rendered frame into the next scene." : "Choose a format or describe the shot. Triven can automatically switch longer stories into scene mode."}</p>
+   </div>;
+ }
+diff --git a/components/cinema/scene-builder.tsx b/components/cinema/scene-builder.tsx
+new file mode 100644
+index 0000000..3bb7a20
+--- /dev/null
++++ b/components/cinema/scene-builder.tsx
+@@ -0,0 +1,71 @@
++"use client";
++
++import type { ScenePlan, ScenePlanItem } from "@/lib/types";
++
++function renumber(scenes: ScenePlanItem[]) {
++  return scenes.map((scene, index) => ({ ...scene, order: index + 1 }));
++}
++
++export function SceneBuilder({ plan, onChange, onClose }: { plan: ScenePlan; onChange: (plan: ScenePlan) => void; onClose: () => void }) {
++  function updateScene(index: number, patch: Partial<ScenePlanItem>) {
++    const scenes = plan.scenes.map((scene, sceneIndex) => sceneIndex === index ? { ...scene, ...patch } : scene);
++    onChange({ ...plan, scenes: renumber(scenes) });
++  }
++
++  function move(index: number, direction: -1 | 1) {
++    const next = index + direction;
++    if (next < 0 || next >= plan.scenes.length) return;
++    const scenes = [...plan.scenes];
++    [scenes[index], scenes[next]] = [scenes[next], scenes[index]];
++    onChange({ ...plan, scenes: renumber(scenes) });
++  }
++
++  function remove(index: number) {
++    if (plan.scenes.length <= 1) return;
++    onChange({ ...plan, scenes: renumber(plan.scenes.filter((_, sceneIndex) => sceneIndex !== index)) });
++  }
++
++  function addScene() {
++    const previous = plan.scenes.at(-1);
++    const next: ScenePlanItem = {
++      order: plan.scenes.length + 1,
++      title: `Scene ${plan.scenes.length + 1}`,
++      duration: Math.min(8, previous?.duration || 6),
++      prompt: "Continue the story with the same recurring character identities, visual style, world rules, and established continuity. Describe one clear visual beat.",
++      action: "Continue the next story beat.",
++      mustHave: [],
++      memory: previous?.memory ? {
++        ...previous.memory,
++        previousSceneSummary: `${previous.title}: ${previous.action || previous.visual || previous.prompt}`.slice(0, 900),
++        bridgeFromPrevious: true,
++      } : undefined,
++    };
++    onChange({ ...plan, scenes: [...plan.scenes, next] });
++  }
++
++  return <div className="sceneBuilder">
++    <div className="sceneBuilderHead">
++      <div><span className="sceneBuilderEyebrow">SCENE STUDIO</span><strong>{plan.scenes.length} planned scenes</strong><p>{plan.summary}</p></div>
++      <button type="button" className="sceneClose" onClick={onClose}>Hide</button>
++    </div>
++    <div className="sceneMemoryBanner"><strong>Continuity memory</strong><p>{plan.continuityContext}</p></div>
++    <div className="sceneEditorList">
++      {plan.scenes.map((scene, index) => <article className="sceneEditorCard" key={`${scene.order}-${index}`}>
++        <div className="sceneEditorTop">
++          <span className="sceneNumber">{String(index + 1).padStart(2, "0")}</span>
++          <input aria-label={`Scene ${index + 1} title`} value={scene.title} onChange={(event) => updateScene(index, { title: event.target.value.slice(0, 120) })} />
++          <label><span>Sec</span><input type="number" min={2} max={20} value={scene.duration} onChange={(event) => updateScene(index, { duration: Math.max(2, Math.min(20, Number(event.target.value) || 2)) })} /></label>
++          <div className="sceneReorder"><button type="button" onClick={() => move(index, -1)} disabled={index === 0} aria-label="Move scene up">↑</button><button type="button" onClick={() => move(index, 1)} disabled={index === plan.scenes.length - 1} aria-label="Move scene down">↓</button><button type="button" onClick={() => remove(index)} disabled={plan.scenes.length <= 1}>Remove</button></div>
++        </div>
++        <textarea aria-label={`Scene ${index + 1} prompt`} value={scene.prompt} maxLength={5000} onChange={(event) => updateScene(index, { prompt: event.target.value })} />
++        {scene.memory && <div className="sceneMemoryGrid">
++          <div><span>Character lock</span><p>{scene.memory.characterLock}</p></div>
++          <div><span>World lock</span><p>{scene.memory.worldLock}</p></div>
++          {scene.memory.previousSceneSummary && <div><span>Previous scene memory</span><p>{scene.memory.previousSceneSummary}</p></div>}
++          <div><span>Bridge</span><p>{scene.memory.bridgeFromPrevious ? "Carry the previous rendered frame into this scene when possible." : "Use text memory only for this cut."}</p></div>
++        </div>}
++      </article>)}
++    </div>
++    <button type="button" className="addSceneButton" onClick={addScene}>+ Add scene</button>
++  </div>;
++}
+diff --git a/components/cinema/use-conversations.ts b/components/cinema/use-conversations.ts
+index 0fbbfc9..333e46d 100644
+--- a/components/cinema/use-conversations.ts
++++ b/components/cinema/use-conversations.ts
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ import { useCallback, useEffect, useRef, useState } from "react";
+-import type { ScenePlanItem } from "@/lib/types";
++import type { ScenePlan, ScenePlanItem } from "@/lib/types";
+ import { conversationTitle, inferPromptSettings, isActive, normalizeQuality, turnFromJob, turnStatusFromJob, type Conversation, type Generation, type Turn } from "./chat-model";
+ 
+ const STORAGE_KEY = "triven.conversations.v1";
+@@ -188,7 +188,7 @@ export function useConversations() {
+     }
+   }, [conversations, updateTurn]);
+ 
+-  function submit(rawPrompt: string, original?: Turn, explicitSettings?: Turn["settings"]): boolean {
++  function submit(rawPrompt: string, original?: Turn, explicitSettings?: Turn["settings"], explicitPlan?: ScenePlan): boolean {
+     const prompt = rawPrompt.trim();
+     if (!ready || prompt.length < 5 || prompt.length > 12000) return false;
+     const chatId = activeId || crypto.randomUUID();
+@@ -206,10 +206,10 @@ export function useConversations() {
+ 
+     void (async () => {
+       try {
+-        let scenes: ScenePlanItem[] | undefined = original?.job?.scenes;
+-        let continuityContext = original?.job?.metadata?.continuityContext || "";
++        let scenes: ScenePlanItem[] | undefined = explicitPlan?.scenes || original?.job?.scenes;
++        let continuityContext = explicitPlan?.continuityContext || original?.job?.metadata?.continuityContext || "";
+         if (settings.mode === "SCENES" && !scenes?.length) {
+-          const response = await fetch("/api/plan", { method: "POST", headers: { "content-type": "application/json" }, signal: controller.signal, body: JSON.stringify({ prompt, durationSeconds: settings.durationSeconds, aspectRatio: settings.aspectRatio }) });
++          const response = await fetch("/api/plan", { method: "POST", headers: { "content-type": "application/json" }, signal: controller.signal, body: JSON.stringify({ prompt, durationSeconds: settings.durationSeconds, aspectRatio: settings.aspectRatio, videoType: settings.videoType, continuityMode: settings.continuityMode }) });
+           if (!response.ok) throw new Error("planning");
+           const plan = await response.json();
+           scenes = plan.scenes;
+@@ -219,7 +219,7 @@ export function useConversations() {
+         updateTurn(chatId, turn.id, { status: "STARTING" });
+         const response = await fetch("/api/generations", {
+           method: "POST", headers: { "content-type": "application/json" }, signal: controller.signal,
+-          body: JSON.stringify({ clientRequestId: turn.id, prompt, mode: settings.mode, videoType: settings.videoType, aspectRatio: settings.aspectRatio, quality: settings.quality, renderMode: settings.renderMode, resolution: settings.resolution, fps: settings.fps, audioQuality: settings.audioQuality, durationSeconds: settings.durationSeconds, model: "ltx-2.5", nativeAudio: original?.job?.nativeAudio ?? settings.nativeAudio, enhancePrompt: original?.job?.enhancePrompt ?? false, seed: Math.floor(Math.random() * 2_147_483_647), continuityContext, scenes }),
++          body: JSON.stringify({ clientRequestId: turn.id, prompt, mode: settings.mode, videoType: settings.videoType, aspectRatio: settings.aspectRatio, quality: settings.quality, renderMode: settings.renderMode, resolution: settings.resolution, fps: settings.fps, audioQuality: settings.audioQuality, durationSeconds: settings.durationSeconds, model: "ltx-2.5", nativeAudio: original?.job?.nativeAudio ?? settings.nativeAudio, enhancePrompt: original?.job?.enhancePrompt ?? false, seed: Math.floor(Math.random() * 2_147_483_647), continuityContext, continuityMode: settings.continuityMode, scenes }),
+         });
+         const payload = await response.json();
+         const job = payload as Generation;
+diff --git a/lib/modal.ts b/lib/modal.ts
+index 56c9712..707331c 100644
+--- a/lib/modal.ts
++++ b/lib/modal.ts
+@@ -1,5 +1,6 @@
+ import type {
+   AudioQuality,
++  ContinuityMode,
+   FrameRate,
+   ModalEditState,
+   ModalJobState,
+@@ -22,6 +23,7 @@ type SubmitInput = {
+   audioQuality: AudioQuality;
+   durationSeconds: number;
+   nativeAudio: boolean;
++  continuityMode: ContinuityMode;
+   seed: number;
+   scenes?: ScenePlanItem[];
+ };
+diff --git a/lib/scene-planner.ts b/lib/scene-planner.ts
+index 42ea3aa..fff970b 100644
+--- a/lib/scene-planner.ts
++++ b/lib/scene-planner.ts
+@@ -1,4 +1,4 @@
+-import type { ProductionBrief, ScenePlan, ScenePlanItem } from "@/lib/types";
++import type { ContinuityMode, ProductionBrief, ScenePlan, ScenePlanItem, VideoType } from "@/lib/types";
+ 
+ const MAX_SCENES = 30;
+ const MAX_SCENE_SECONDS = 20;
+@@ -44,8 +44,18 @@ function extractInline(prompt: string, labels: string[]): string {
+ 
+ function extractBullets(section: string): string[] {
+   if (!section) return [];
+-  const lines = section.split("\n").map((line) => line.replace(/^\s*[-*•]\s*/, "").trim()).filter(Boolean);
+-  return unique(lines.length > 1 ? lines : section.split(/[.;]\s+/));
++  const lines = section.split("\n").map((line) => line.replace(/^\s*[-*•]\s*/, "").trim()).filter(Boolean).filter((line) => !/^(?:main character|characters?|setting|audio|camera|rules?)\s*:?$/i.test(line));
++  return unique(lines.length > 1 ? lines : section.split(/[.;]\s+/)).filter((line) => !/^(?:main character|characters?|setting|audio|camera|rules?)\s*:?$/i.test(line));
++}
++
++function inferNaturalCharacters(prompt: string): string[] {
++  const beforeScenes = prompt.split(/\n\s*#{0,4}\s*SCENE\s+1\b/i)[0];
++  const candidates = beforeScenes
++    .split(/(?<=[.!?])\s+|\n+/)
++    .map(oneLine)
++    .filter((line) => line.length >= 12 && line.length <= 700)
++    .filter((line) => /\b(?:girl|boy|woman|man|child|children|kid|kids|person|people|character|hero|heroine|protagonist|guide|teacher|student|family|couple|baby|fox|dog|cat|bird|animal|robot|creature|princess|prince|king|queen|knight|explorer|adventurer)\b/i.test(line));
++  return unique(candidates).slice(0, 4);
+ }
+ 
+ function titleFromPrompt(prompt: string): string {
+@@ -119,11 +129,14 @@ function buildProductionBrief(prompt: string): ProductionBrief {
+   if (/text|logo|label|sign|caption|typography/i.test(prompt)) warnings.push("Generated typography can be unstable. Add final text, logos, captions, and legal copy in the editing pass rather than inside the generated image when exact spelling matters.");
+   if (/consistent|same character|identical/i.test(prompt)) warnings.push("For strongest identity consistency, use image-conditioned shots or reference-control workflows when available; text-only continuity remains probabilistic.");
+ 
++  const explicitCharacters = extractBullets(characterSection).slice(0, 20);
++  const characters = explicitCharacters.length ? explicitCharacters : inferNaturalCharacters(prompt);
++
+   return {
+     title: titleFromPrompt(prompt),
+     intent: detectIntent(prompt),
+     visualStyle,
+-    characters: extractBullets(characterSection).slice(0, 20),
++    characters,
+     locations: extractBullets(settingSection).slice(0, 20),
+     cameraLanguage,
+     audioDirection,
+@@ -236,15 +249,73 @@ function sentenceBeats(prompt: string): string[] {
+   return unique(withoutGlobal.split(/(?<=[.!?])\s+|\n+/).filter((part) => oneLine(part).length >= 15)).slice(0, 40);
+ }
+ 
+-function deterministicPlan(prompt: string, durationSeconds: number): ScenePlan {
++
++
++function memoryLocks(productionBrief: ProductionBrief) {
++  const characterLock = oneLine(
++    productionBrief.characters.length
++      ? `Recurring character bible: ${productionBrief.characters.join(" | ")}`
++      : productionBrief.continuity,
++  ).slice(0, 1600);
++  const worldLock = oneLine([
++    productionBrief.visualStyle,
++    productionBrief.locations.length ? `Locations: ${productionBrief.locations.join(" | ")}` : "",
++    productionBrief.cameraLanguage ? `Camera language: ${productionBrief.cameraLanguage}` : "",
++  ].filter(Boolean).join(" ")).slice(0, 1600);
++  return { characterLock, worldLock };
++}
++
++function applySceneMemory(scenes: ScenePlanItem[], productionBrief: ProductionBrief, continuityMode: ContinuityMode): ScenePlanItem[] {
++  const { characterLock, worldLock } = memoryLocks(productionBrief);
++  let previousSceneSummary = "";
++  return scenes.map((scene, index) => {
++    const transitionText = `${scene.transition || ""} ${scene.prompt}`.toLowerCase();
++    const obviousReset = /flashback|dream sequence|completely different character|new protagonist|identity change/.test(transitionText);
++    const bridgeFromPrevious = index > 0 && !obviousReset && (continuityMode === "strict" || (continuityMode === "balanced" && !/smash cut|hard cut to a different|jump cut to a different/.test(transitionText)));
++    const carryForward = unique([
++      ...productionBrief.mustHave,
++      ...(scene.mustHave || []),
++      "Keep recurring faces, body proportions, age, hair, wardrobe, accessories and voice unchanged unless this scene explicitly changes them.",
++    ]).slice(0, 20);
++    const allowedChanges = unique([
++      scene.action || "Only the action, pose, expression, framing and environment details explicitly requested for this scene may change.",
++      scene.transition || "",
++    ]).slice(0, 12);
++    const memory = {
++      characterLock,
++      worldLock,
++      previousSceneSummary: previousSceneSummary || undefined,
++      carryForward,
++      allowedChanges,
++      bridgeFromPrevious,
++    };
++    const memoryPrompt = oneLine([
++      scene.prompt,
++      `IMMUTABLE CHARACTER MEMORY: ${characterLock}`,
++      `WORLD AND STYLE MEMORY: ${worldLock}`,
++      previousSceneSummary ? `PREVIOUS SCENE STATE: ${previousSceneSummary}` : "",
++      carryForward.length ? `CARRY FORWARD: ${carryForward.join("; ")}` : "",
++      allowedChanges.length ? `THIS SCENE MAY CHANGE ONLY: ${allowedChanges.join("; ")}` : "",
++      bridgeFromPrevious ? "CONTINUITY BRIDGE: begin from the visual state left by the previous scene and preserve identity before advancing the new action." : "",
++      "Never redesign a recurring character between scenes. Do not invent new clothing, facial features, age, body shape, accessories, or voice unless the story explicitly requires the change.",
++    ].filter(Boolean).join(" ")).slice(0, 4900);
++    previousSceneSummary = oneLine(`${scene.title}. ${scene.action || scene.visual || scene.prompt}`).slice(0, 900);
++    return { ...scene, prompt: memoryPrompt, memory };
++  });
++}
++
++function deterministicPlan(prompt: string, durationSeconds: number, continuityMode: ContinuityMode, videoType: VideoType): ScenePlan {
+   const productionBrief = buildProductionBrief(prompt);
++  if (videoType === "social") productionBrief.intent = "Create a high-retention vertical social video with a strong first-second hook, rapid readable beats, pattern interrupts, and a clear payoff.";
++  if (videoType === "cartoon") productionBrief.intent = "Tell a visually clear animated story with stable character designs, readable emotions, family-friendly staging, and strong scene-to-scene continuity.";
++  if (videoType === "story") productionBrief.intent = "Tell a coherent story with setup, escalation, payoff, recurring-character memory, and motivated scene transitions.";
+   const explicitScenes = parseSceneBlocks(prompt);
+   if (explicitScenes.length) {
+     return {
+       summary: `Director parsed ${explicitScenes.length} explicit scene${explicitScenes.length === 1 ? "" : "s"}, isolated visual/action/audio instructions, and built a continuity lock before generation.`,
+       continuityContext: productionBrief.continuity,
+       productionBrief,
+-      scenes: explicitScenes,
++      scenes: applySceneMemory(explicitScenes, productionBrief, continuityMode),
+     };
+   }
+ 
+@@ -292,7 +363,7 @@ function deterministicPlan(prompt: string, durationSeconds: number): ScenePlan {
+     summary: `Director converted the request into ${sceneCount} chronological shots with a shared continuity bible and scene-specific instructions.`,
+     continuityContext: productionBrief.continuity,
+     productionBrief,
+-    scenes,
++    scenes: applySceneMemory(scenes, productionBrief, continuityMode),
+   };
+ }
+ 
+@@ -300,9 +371,11 @@ export async function planScenes(
+   prompt: string,
+   durationSeconds: number,
+   _aspectRatio: string,
++  continuityMode: ContinuityMode = "balanced",
++  videoType: VideoType = "cinematic",
+ ): Promise<ScenePlan> {
+   void _aspectRatio;
+-  return deterministicPlan(prompt, durationSeconds);
++  return deterministicPlan(prompt, durationSeconds, continuityMode, videoType);
+ }
+ 
+ export function analyzeVideoPrompt(prompt: string): ProductionBrief {
+diff --git a/lib/schemas.ts b/lib/schemas.ts
+index 404e76d..818a4b9 100644
+--- a/lib/schemas.ts
++++ b/lib/schemas.ts
+@@ -12,12 +12,22 @@ export const sceneSchema = z.object({
+   dialogue: z.string().max(1500).optional(),
+   transition: z.string().max(500).optional(),
+   mustHave: z.array(z.string().max(300)).max(20).optional(),
++  memory: z.object({
++    characterLock: z.string().max(1800),
++    worldLock: z.string().max(1800),
++    previousSceneSummary: z.string().max(1200).optional(),
++    carryForward: z.array(z.string().max(300)).max(20),
++    allowedChanges: z.array(z.string().max(300)).max(20),
++    bridgeFromPrevious: z.boolean(),
++  }).optional(),
+ });
+ 
+ export const planSchema = z.object({
+   prompt: z.string().min(5).max(12000),
+   durationSeconds: z.number().int().min(5).max(180).default(20),
+   aspectRatio: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
++  videoType: z.enum(["cartoon", "story", "cinematic", "product-ad", "explainer", "social"]).default("cinematic"),
++  continuityMode: z.enum(["creative", "balanced", "strict"]).default("balanced"),
+ });
+ 
+ const fpsSchema = z.union([
+@@ -40,6 +50,7 @@ export const generationSchema = z.object({
+   resolution: z.enum(["720p", "1080p", "1440p", "4k"]).default("1080p"),
+   fps: fpsSchema.default(24),
+   audioQuality: z.enum(["off", "standard", "high"]).default("standard"),
++  continuityMode: z.enum(["creative", "balanced", "strict"]).default("balanced"),
+   durationSeconds: z.number().int().min(2).max(180),
+   nativeAudio: z.boolean(),
+   enhancePrompt: z.boolean(),
+diff --git a/lib/types.ts b/lib/types.ts
+index 47b89f2..f14ea11 100644
+--- a/lib/types.ts
++++ b/lib/types.ts
+@@ -7,6 +7,7 @@ export type RenderMode = "fast" | "pro";
+ export type Resolution = "720p" | "1080p" | "1440p" | "4k";
+ export type FrameRate = 24 | 25 | 30 | 48 | 50;
+ export type AudioQuality = "off" | "standard" | "high";
++export type ContinuityMode = "creative" | "balanced" | "strict";
+ export type GenerationStatus =
+   | "QUEUED"
+   | "PLANNING"
+@@ -19,6 +20,15 @@ export type GenerationStatus =
+   | "COMPLETED"
+   | "FAILED";
+ 
++export type SceneMemory = {
++  characterLock: string;
++  worldLock: string;
++  previousSceneSummary?: string;
++  carryForward: string[];
++  allowedChanges: string[];
++  bridgeFromPrevious: boolean;
++};
++
+ export type ScenePlanItem = {
+   order: number;
+   title: string;
+@@ -31,6 +41,7 @@ export type ScenePlanItem = {
+   dialogue?: string;
+   transition?: string;
+   mustHave?: string[];
++  memory?: SceneMemory;
+ };
+ 
+ export type ProductionBrief = {
+diff --git a/modal/cinema.py b/modal/cinema.py
+index 62669a8..1210e49 100644
+--- a/modal/cinema.py
++++ b/modal/cinema.py
+@@ -224,6 +224,14 @@ def _crop(input_path: str, output_path: str, width: int, height: int, render_mod
+     subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+ 
+ 
++def _extract_last_frame(input_path: str, output_path: str) -> str:
++    subprocess.run([
++        "ffmpeg", "-y", "-sseof", "-0.08", "-i", input_path,
++        "-frames:v", "1", "-q:v", "2", output_path,
++    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    return output_path
++
++
+ def _concat(paths: list[str], output_path: str) -> None:
+     list_path = Path(output_path).with_suffix(".txt")
+     list_path.write_text("\n".join(f"file '{Path(p).as_posix()}'" for p in paths) + "\n")
+@@ -570,13 +578,16 @@ class LTXWorker:
+     @modal.enter()
+     def load(self):
+         import torch
+-        from diffusers import FlowMatchEulerDiscreteScheduler, LTX2LatentUpsamplePipeline, LTX2Pipeline
++        from diffusers import FlowMatchEulerDiscreteScheduler, LTX2ImageToVideoPipeline, LTX2LatentUpsamplePipeline, LTX2Pipeline
+         from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+ 
+         token = os.environ.get("HF_TOKEN")
+         self.pipe = LTX2Pipeline.from_pretrained(MODEL_REPO, torch_dtype=torch.bfloat16, cache_dir=CACHE_ROOT, token=token)
+         self.pipe.to("cuda")
+         self.pipe.vae.enable_tiling()
++        self.i2v_pipe = LTX2ImageToVideoPipeline.from_pipe(self.pipe)
++        self.i2v_pipe.to("cuda")
++        self.i2v_pipe.vae.enable_tiling()
+         self.fast_transformer = self.pipe.transformer
+         self.fast_scheduler = self.pipe.scheduler
+         self.pro_transformer = None
+@@ -603,9 +614,13 @@ class LTXWorker:
+             self._ensure_pro()
+             self.pipe.transformer = self.pro_transformer
+             self.pipe.scheduler = self.pro_scheduler
++            self.i2v_pipe.transformer = self.pro_transformer
++            self.i2v_pipe.scheduler = self.pro_scheduler
+         else:
+             self.pipe.transformer = self.fast_transformer
+             self.pipe.scheduler = self.fast_scheduler
++            self.i2v_pipe.transformer = self.fast_transformer
++            self.i2v_pipe.scheduler = self.fast_scheduler
+ 
+     def _fast_kwargs(self) -> dict[str, Any]:
+         from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+@@ -637,10 +652,10 @@ class LTXWorker:
+             "use_cross_timestep": True,
+         }
+ 
+-    def _render_clip(self, prompt: str, aspect: str, render_mode: str, resolution: str, fps: int, duration: int, audio_quality: str, seed: int, out_dir: str, index: int) -> str:
++    def _render_clip(self, prompt: str, aspect: str, render_mode: str, resolution: str, fps: int, duration: int, audio_quality: str, seed: int, out_dir: str, index: int, reference_image: str | None = None) -> str:
+         import torch
+         from diffusers.pipelines.ltx2.utils import DEFAULT_NEGATIVE_PROMPT, STAGE_2_DISTILLED_SIGMA_VALUES
+-        from diffusers.utils import encode_video
++        from diffusers.utils import encode_video, load_image
+ 
+         render_mode = _normalize_render_mode(render_mode)
+         resolution = _normalize_resolution(resolution)
+@@ -653,8 +668,11 @@ class LTXWorker:
+ 
+         self._activate_mode(render_mode)
+         stage_one = self._pro_kwargs() if render_mode == "pro" else self._fast_kwargs()
++        active_pipe = self.i2v_pipe if reference_image else self.pipe
++        conditioning = {"image": load_image(reference_image)} if reference_image else {}
+         if upscale_count == 0:
+-            video, audio = self.pipe(
++            video, audio = active_pipe(
++                **conditioning,
+                 prompt=prompt,
+                 negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+                 width=source_w,
+@@ -667,7 +685,8 @@ class LTXWorker:
+                 **stage_one,
+             )
+         else:
+-            video_latent, audio_latent = self.pipe(
++            video_latent, audio_latent = active_pipe(
++                **conditioning,
+                 prompt=prompt,
+                 negative_prompt=DEFAULT_NEGATIVE_PROMPT,
+                 width=source_w,
+@@ -739,18 +758,30 @@ class LTXWorker:
+             if mode == "SCENES":
+                 scenes = request.get("scenes") or []
+                 total = max(1, len(scenes))
++                continuity_mode = str(request.get("continuityMode", "balanced")).lower()
++                previous_frame: str | None = None
+                 for i, scene in enumerate(scenes):
+                     if _job_cancelled(job_id):
+                         raise RuntimeError("Generation stopped by user")
+                     scene_duration = int(scene.get("duration", 5))
+                     if scene_duration > clip_limit:
+                         raise ValueError(f"This render profile supports up to {clip_limit}s per scene; scene {i + 1} is {scene_duration}s.")
++                    memory = scene.get("memory") or {}
++                    use_bridge = bool(previous_frame) and (
++                        continuity_mode == "strict"
++                        or (continuity_mode == "balanced" and bool(memory.get("bridgeFromPrevious", False)))
++                    )
+                     progress = 12 + int((i / total) * 66)
+-                    _set_job(job_id, status="GENERATING", progress=progress, message=f"Rendering scene {i + 1} of {total} | {profile}", sceneIndex=i + 1, sceneCount=total)
+-                    clips.append(self._render_clip(
++                    bridge_label = " | previous-frame memory" if use_bridge else ""
++                    _set_job(job_id, status="GENERATING", progress=progress, message=f"Rendering scene {i + 1} of {total} | {profile}{bridge_label}", sceneIndex=i + 1, sceneCount=total)
++                    clip = self._render_clip(
+                         prompt=scene["prompt"], aspect=request["aspectRatio"], render_mode=render_mode, resolution=resolution,
+                         fps=fps, duration=scene_duration, audio_quality=audio_quality, seed=int(request.get("seed", 42)), out_dir=temp_dir, index=i,
+-                    ))
++                        reference_image=previous_frame if use_bridge else None,
++                    )
++                    clips.append(clip)
++                    if continuity_mode != "creative":
++                        previous_frame = _extract_last_frame(clip, str(Path(temp_dir) / f"memory-frame-{i}.png"))
+             else:
+                 direct_duration = int(request.get("durationSeconds", 5))
+                 if direct_duration > clip_limit:

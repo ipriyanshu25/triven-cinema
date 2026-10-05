@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ScenePlan, ScenePlanItem } from "@/lib/types";
-import { conversationTitle, inferPromptSettings, isActive, normalizeGenerationJob, normalizeQuality, turnFromJob, turnStatusFromJob, type Conversation, type Generation, type Turn } from "./chat-model";
+import { conversationTitle, inferPromptSettings, isActive, normalizeQuality, turnFromJob, turnStatusFromJob, type Conversation, type Generation, type Turn } from "./chat-model";
 
 const STORAGE_KEY = "triven.conversations.v1";
 
@@ -52,7 +52,7 @@ export function useConversations() {
       try {
         const response = await fetch("/api/generations?limit=20", { cache: "no-store", signal: controller.signal });
         if (!response.ok) throw new Error("history");
-        const jobs: Generation[] = ((await response.json()) as Generation[]).map(normalizeGenerationJob);
+        const jobs: Generation[] = await response.json();
         if (controller.signal.aborted) return;
         const firstLoad = !initialized.current;
         setConversations((current) => {
@@ -106,7 +106,7 @@ export function useConversations() {
         try {
           const response = await fetch(`/api/generations/${encodeURIComponent(jobId)}`, { cache: "no-store", signal: controller.signal });
           if (!response.ok) throw new Error("status");
-          const job = normalizeGenerationJob((await response.json()) as Generation);
+          const job: Generation = await response.json();
           if (!controller.signal.aborted) updateTurn(chatId, turnId, { job, status: turnStatusFromJob(job), connectionLost: false });
         } catch {
           if (!controller.signal.aborted) updateTurn(chatId, turnId, { connectionLost: true });
@@ -176,7 +176,7 @@ export function useConversations() {
 
     try {
       const response = await fetch(`/api/generations/${encodeURIComponent(turn.job.id)}/cancel`, { method: "POST" });
-      const job = normalizeGenerationJob((await response.json()) as Generation);
+      const job: Generation = await response.json();
       if (!response.ok) throw new Error("cancel");
       updateTurn(chatId, turnId, { job, status: turnStatusFromJob(job), connectionLost: false });
       setNotice(job.status === "CANCEL_REQUESTED" ? "Stop requested. The worker will exit at the next safe checkpoint." : "");
@@ -190,7 +190,7 @@ export function useConversations() {
 
   function submit(rawPrompt: string, original?: Turn, explicitSettings?: Turn["settings"], explicitPlan?: ScenePlan): boolean {
     const prompt = rawPrompt.trim();
-    if (!ready || prompt.length < 5) return false;
+    if (!ready || prompt.length < 5 || prompt.length > 12000) return false;
     const chatId = activeId || crypto.randomUUID();
     if (submitting.current.has(chatId) || conversations.find((chat) => chat.id === chatId)?.turns.some((turn) => isActive(turn.status))) return false;
     submitting.current.add(chatId);
@@ -208,23 +208,21 @@ export function useConversations() {
       try {
         let scenes: ScenePlanItem[] | undefined = explicitPlan?.scenes || original?.job?.scenes;
         let continuityContext = explicitPlan?.continuityContext || original?.job?.metadata?.continuityContext || "";
-        let productionBrief = explicitPlan?.productionBrief || original?.job?.analysis || undefined;
         if (settings.mode === "SCENES" && !scenes?.length) {
-          const response = await fetch("/api/plan", { method: "POST", headers: { "content-type": "application/json" }, signal: controller.signal, body: JSON.stringify({ prompt, durationSeconds: settings.durationSeconds, aspectRatio: settings.aspectRatio, videoType: settings.videoType, continuityMode: settings.continuityMode, storyAccuracy: settings.storyAccuracy }) });
+          const response = await fetch("/api/plan", { method: "POST", headers: { "content-type": "application/json" }, signal: controller.signal, body: JSON.stringify({ prompt, durationSeconds: settings.durationSeconds, aspectRatio: settings.aspectRatio, videoType: settings.videoType, continuityMode: settings.continuityMode }) });
           if (!response.ok) throw new Error("planning");
           const plan = await response.json();
           scenes = plan.scenes;
           continuityContext = plan.continuityContext || "";
-          productionBrief = plan.productionBrief;
         }
         if (controller.signal.aborted) return;
         updateTurn(chatId, turn.id, { status: "STARTING" });
         const response = await fetch("/api/generations", {
           method: "POST", headers: { "content-type": "application/json" }, signal: controller.signal,
-          body: JSON.stringify({ clientRequestId: turn.id, prompt, mode: settings.mode, videoType: settings.videoType, aspectRatio: settings.aspectRatio, quality: settings.quality, renderMode: settings.renderMode, resolution: settings.resolution, fps: settings.fps, audioQuality: settings.audioQuality, durationSeconds: settings.durationSeconds, model: "ltx-2.5", nativeAudio: original?.job?.nativeAudio ?? settings.nativeAudio, enhancePrompt: original?.job?.enhancePrompt ?? false, seed: Math.floor(Math.random() * 2_147_483_647), continuityContext, continuityMode: settings.continuityMode, storyAccuracy: settings.storyAccuracy, productionBrief, scenes }),
+          body: JSON.stringify({ clientRequestId: turn.id, prompt, mode: settings.mode, videoType: settings.videoType, aspectRatio: settings.aspectRatio, quality: settings.quality, renderMode: settings.renderMode, resolution: settings.resolution, fps: settings.fps, audioQuality: settings.audioQuality, durationSeconds: settings.durationSeconds, model: "ltx-2.5", nativeAudio: original?.job?.nativeAudio ?? settings.nativeAudio, enhancePrompt: original?.job?.enhancePrompt ?? false, seed: Math.floor(Math.random() * 2_147_483_647), continuityContext, continuityMode: settings.continuityMode, scenes }),
         });
         const payload = await response.json();
-        const job = normalizeGenerationJob(payload as Generation);
+        const job = payload as Generation;
         // The API can return a persisted failed job with HTTP 502; retain its ID.
         if (job.id && job.status) updateTurn(chatId, turn.id, { job, status: turnStatusFromJob(job) });
         else {

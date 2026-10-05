@@ -11,7 +11,8 @@
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:push": "prisma db push",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "check": "npm run lint && npm run build && python3 -m py_compile modal/cinema.py"
   },
   "dependencies": {
     "@gradio/client": "^2.7.1",
