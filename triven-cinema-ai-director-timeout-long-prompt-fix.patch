@@ -1,0 +1,151 @@
+--- a/.env.example
++++ b/.env.example
+@@ -28,3 +28,6 @@
+ TRIVEN_STORY_DIRECTOR=true
+ # Override only if you intentionally switch the local Director model.
+ STORY_DIRECTOR_MODEL=Qwen/Qwen3-VL-4B-Instruct
++
++# AI Story Director: allow GPU cold start + planning without silently falling back after 2 minutes.
++TRIVEN_DIRECTOR_TIMEOUT_MS=480000
+--- a/lib/modal.ts
++++ b/lib/modal.ts
+@@ -58,12 +58,16 @@
+ 
+ export async function planModalStory(input: DirectorPlanInput): Promise<Record<string, unknown>> {
+   const { base, secret } = config();
++  const configuredTimeout = Number(process.env.TRIVEN_DIRECTOR_TIMEOUT_MS || 480000);
++  const timeoutMs = Number.isFinite(configuredTimeout)
++    ? Math.min(900000, Math.max(120000, Math.round(configuredTimeout)))
++    : 480000;
+   const response = await fetch(`${base}/director/plan`, {
+     method: "POST",
+     headers: { "content-type": "application/json", "x-triven-secret": secret },
+     body: JSON.stringify(input),
+     cache: "no-store",
+-    signal: AbortSignal.timeout(120000),
++    signal: AbortSignal.timeout(timeoutMs),
+   });
+   if (!response.ok) throw new Error(`Modal Director failed (${response.status}): ${await response.text()}`);
+   return response.json();
+--- a/modal/cinema.py
++++ b/modal/cinema.py
+@@ -664,9 +664,10 @@
+     volumes={CACHE_ROOT: model_cache},
+     secrets=[runtime_secret],
+     timeout=1200,
++    startup_timeout=600,
+     min_containers=0,
+     max_containers=1,
+-    scaledown_window=180,
++    scaledown_window=600,
+ )
+ class StorySupervisor:
+     @modal.enter()
+@@ -675,11 +676,16 @@
+         from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+ 
+         token = os.environ.get("HF_TOKEN")
+-        self.processor = AutoProcessor.from_pretrained(DIRECTOR_MODEL_REPO, cache_dir=CACHE_ROOT, token=token)
++        # Production runtime must use the model cached by prefetch_director.
++        # Failing fast here is much better than downloading several GB during an HTTP request.
++        self.processor = AutoProcessor.from_pretrained(
++            DIRECTOR_MODEL_REPO, cache_dir=CACHE_ROOT, token=token, local_files_only=True
++        )
+         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+             DIRECTOR_MODEL_REPO,
+             cache_dir=CACHE_ROOT,
+             token=token,
++            local_files_only=True,
+             torch_dtype=torch.bfloat16,
+             device_map="auto",
+         )
+@@ -702,23 +708,85 @@
+         trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, outputs)]
+         return self.processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+ 
++    @staticmethod
++    def _chunk_source(source: str, max_chars: int = 12000) -> list[str]:
++        source = source.strip()
++        if len(source) <= max_chars:
++            return [source]
++        chunks: list[str] = []
++        current = ""
++        for paragraph in source.split("\n\n"):
++            paragraph = paragraph.strip()
++            if not paragraph:
++                continue
++            if len(paragraph) > max_chars:
++                if current:
++                    chunks.append(current)
++                    current = ""
++                for start in range(0, len(paragraph), max_chars):
++                    chunks.append(paragraph[start:start + max_chars])
++                continue
++            candidate = paragraph if not current else current + "\n\n" + paragraph
++            if len(candidate) > max_chars:
++                chunks.append(current)
++                current = paragraph
++            else:
++                current = candidate
++        if current:
++            chunks.append(current)
++        return chunks or [source]
++
++    def _compress_long_source(self, source: str) -> str:
++        """Hierarchically condense arbitrarily long source text without dropping the ending."""
++        working = source.strip()
++        round_index = 0
++        while len(working) > 24000:
++            chunks = self._chunk_source(working, 12000)
++            summaries: list[str] = []
++            for index, chunk in enumerate(chunks, start=1):
++                raw = self._generate([
++                    {"role": "system", "content": [{"type": "text", "text": (
++                        "You are compressing one part of a longer video story. Preserve named characters, "
++                        "visual identity details, locations, important props, chronological events, dialogue meaning, "
++                        "emotional turns, and especially any ending/resolution facts. Do not invent anything. "
++                        "Return concise production notes only."
++                    )}]},
++                    {"role": "user", "content": [{"type": "text", "text": (
++                        f"PART {index} OF {len(chunks)} (compression round {round_index + 1}):\n{chunk}"
++                    )}]},
++                ], max_new_tokens=700)
++                summaries.append(f"PART {index}/{len(chunks)}:\n{raw.strip()}")
++            working = "\n\n".join(summaries)
++            round_index += 1
++            if round_index >= 6:
++                # A practical safety valve for pathological multi-megabyte inputs. The final reduction still
++                # contains notes from every processed chunk rather than silently slicing off the ending.
++                break
++        return working
++
+     @modal.method()
+     def plan(self, payload: dict[str, Any]) -> dict[str, Any]:
+         duration = int(payload.get("durationSeconds", 45))
+         video_type = str(payload.get("videoType", "story"))
+         aspect = str(payload.get("aspectRatio", "16:9"))
+-        source = str(payload.get("prompt", ""))[:12000]
++        source = str(payload.get("prompt", "")).strip()
++        source_for_plan = self._compress_long_source(source)
++        source_label = "FULL SOURCE" if source_for_plan == source else "HIERARCHICAL FULL-STORY NOTES"
+         user_text = (
+-            f"Create a {duration}-second {video_type} video in {aspect}. Read the complete source before planning. "
++            f"Create a {duration}-second {video_type} video in {aspect}. Read the complete source representation before planning. "
+             "For story/cartoon/devotional content, preserve recurring character identity and cover the ending, not only the opening. "
+-            "The generated image must contain no captions, subtitles, prompt text, or random lettering.\n\nSOURCE:\n" + source
++            "The generated image must contain no captions, subtitles, prompt text, or random lettering. "
++            "If the source was hierarchically condensed, treat every part as canonical and preserve chronology.\n\n"
++            f"{source_label}:\n{source_for_plan}"
+         )
+         raw = self._generate([
+             {"role": "system", "content": [{"type": "text", "text": DIRECTOR_SYSTEM_PROMPT}]},
+             {"role": "user", "content": [{"type": "text", "text": user_text}]},
+-        ], max_new_tokens=4200)
++        ], max_new_tokens=3000)
+         result = _extract_json_object(raw)
+         result["directorModel"] = DIRECTOR_MODEL_REPO
++        result["sourceCharacters"] = len(source)
++        result["hierarchicalSourceCompression"] = source_for_plan != source
+         return result
+ 
+     @modal.method()

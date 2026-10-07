@@ -58,12 +58,16 @@ function config() {
 
 export async function planModalStory(input: DirectorPlanInput): Promise<Record<string, unknown>> {
   const { base, secret } = config();
+  const configuredTimeout = Number(process.env.TRIVEN_DIRECTOR_TIMEOUT_MS || 480000);
+  const timeoutMs = Number.isFinite(configuredTimeout)
+    ? Math.min(900000, Math.max(120000, Math.round(configuredTimeout)))
+    : 480000;
   const response = await fetch(`${base}/director/plan`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-triven-secret": secret },
     body: JSON.stringify(input),
     cache: "no-store",
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) throw new Error(`Modal Director failed (${response.status}): ${await response.text()}`);
   return response.json();

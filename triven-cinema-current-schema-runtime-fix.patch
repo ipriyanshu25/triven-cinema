@@ -1,0 +1,111 @@
+diff -ruN a/lib/schemas.ts b/lib/schemas.ts
+--- a/lib/schemas.ts	2026-10-05 11:34:49.879233338 +0000
++++ b/lib/schemas.ts	2026-10-05 11:34:49.888684854 +0000
+@@ -24,15 +24,50 @@
+     carryForward: z.array(z.string().max(300)).max(20),
+     allowedChanges: z.array(z.string().max(300)).max(20),
+     bridgeFromPrevious: z.boolean(),
++    identityAnchors: z.array(z.string().max(300)).max(30).optional(),
+   }).optional(),
+ });
+ 
++const characterBibleSchema = z.object({
++  name: z.string().min(1).max(120),
++  role: z.string().max(300).optional(),
++  appearance: z.string().min(1).max(1800),
++  wardrobe: z.string().max(1200).optional(),
++  voice: z.string().max(800).optional(),
++  immutableTraits: z.array(z.string().max(300)).max(30),
++});
++
++const productionBriefSchema = z.object({
++  title: z.string().min(1).max(160),
++  source: z.enum(["deterministic", "ai-director"]).optional(),
++  intent: z.string().max(1800),
++  visualStyle: z.string().max(2400),
++  characters: z.array(z.string().max(500)).max(20),
++  locations: z.array(z.string().max(800)).max(20),
++  cameraLanguage: z.string().max(1800),
++  audioDirection: z.string().max(1800),
++  mustHave: z.array(z.string().max(500)).max(30),
++  avoid: z.array(z.string().max(500)).max(30),
++  continuity: z.string().max(6000),
++  warnings: z.array(z.string().max(700)).max(20),
++  sourceSummary: z.string().max(3000).optional(),
++  narrationStyle: z.string().max(1200).optional(),
++  storyArc: z.object({
++    setup: z.string().max(1800),
++    development: z.string().max(1800),
++    climax: z.string().max(1800),
++    resolution: z.string().max(1800),
++  }).optional(),
++  characterBible: z.array(characterBibleSchema).max(20).optional(),
++});
++
+ export const planSchema = z.object({
+   prompt: z.string().min(5),
+   durationSeconds: z.number().int().min(5).max(180).default(20),
+   aspectRatio: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
+-  videoType: z.enum(["cartoon", "story", "cinematic", "product-ad", "explainer", "social"]).default("cinematic"),
++  videoType: z.enum(["cartoon", "story", "devotional", "cinematic", "product-ad", "explainer", "social"]).default("cinematic"),
+   continuityMode: z.enum(["creative", "balanced", "strict"]).default("balanced"),
++  storyAccuracy: z.enum(["standard", "high"]).default("standard"),
+ });
+ 
+ const fpsSchema = z.union([
+diff -ruN a/lib/schemas.ts.rej b/lib/schemas.ts.rej
+--- a/lib/schemas.ts.rej	2026-10-05 11:34:49.883233329 +0000
++++ b/lib/schemas.ts.rej	1970-01-01 00:00:00.000000000 +0000
+@@ -1,52 +0,0 @@
+-@@ -19,15 +24,50 @@
+-     carryForward: z.array(z.string().max(300)).max(20),
+-     allowedChanges: z.array(z.string().max(300)).max(20),
+-     bridgeFromPrevious: z.boolean(),
+-+    identityAnchors: z.array(z.string().max(300)).max(30).optional(),
+-   }).optional(),
+- });
+- 
+-+const characterBibleSchema = z.object({
+-+  name: z.string().min(1).max(120),
+-+  role: z.string().max(300).optional(),
+-+  appearance: z.string().min(1).max(1800),
+-+  wardrobe: z.string().max(1200).optional(),
+-+  voice: z.string().max(800).optional(),
+-+  immutableTraits: z.array(z.string().max(300)).max(30),
+-+});
+-+
+-+const productionBriefSchema = z.object({
+-+  title: z.string().min(1).max(160),
+-+  source: z.enum(["deterministic", "ai-director"]).optional(),
+-+  intent: z.string().max(1800),
+-+  visualStyle: z.string().max(2400),
+-+  characters: z.array(z.string().max(500)).max(20),
+-+  locations: z.array(z.string().max(800)).max(20),
+-+  cameraLanguage: z.string().max(1800),
+-+  audioDirection: z.string().max(1800),
+-+  mustHave: z.array(z.string().max(500)).max(30),
+-+  avoid: z.array(z.string().max(500)).max(30),
+-+  continuity: z.string().max(6000),
+-+  warnings: z.array(z.string().max(700)).max(20),
+-+  sourceSummary: z.string().max(3000).optional(),
+-+  narrationStyle: z.string().max(1200).optional(),
+-+  storyArc: z.object({
+-+    setup: z.string().max(1800),
+-+    development: z.string().max(1800),
+-+    climax: z.string().max(1800),
+-+    resolution: z.string().max(1800),
+-+  }).optional(),
+-+  characterBible: z.array(characterBibleSchema).max(20).optional(),
+-+});
+-+
+- export const planSchema = z.object({
+-   prompt: z.string().min(5).max(12000),
+-   durationSeconds: z.number().int().min(5).max(180).default(20),
+-   aspectRatio: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
+--  videoType: z.enum(["cartoon", "story", "cinematic", "product-ad", "explainer", "social"]).default("cinematic"),
+-+  videoType: z.enum(["cartoon", "story", "devotional", "cinematic", "product-ad", "explainer", "social"]).default("cinematic"),
+-   continuityMode: z.enum(["creative", "balanced", "strict"]).default("balanced"),
+-+  storyAccuracy: z.enum(["standard", "high"]).default("standard"),
+- });
+- 
+- const fpsSchema = z.union([

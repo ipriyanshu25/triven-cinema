@@ -1,0 +1,151 @@
+--- a/modal/cinema.py
++++ b/modal/cinema.py
+@@ -23,6 +23,7 @@
+ When S3-compatible storage is not configured, outputs remain in a Modal Volume.
+ """
+ 
++import gc
+ import hashlib
+ import hmac
+ import io
+@@ -64,7 +65,7 @@
+ gpu_image = (
+     modal.Image.from_registry("nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04", add_python="3.12")
+     .apt_install("ffmpeg", "git", "build-essential", "gcc", "g++", "ninja-build", "fonts-dejavu-core")
+-    .env({"CC": "/usr/bin/gcc", "CXX": "/usr/bin/g++"})
++    .env({"CC": "/usr/bin/gcc", "CXX": "/usr/bin/g++", "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+     .pip_install(
+         "torch>=2.9.1",
+         "torchvision>=0.24.1",
+@@ -777,42 +778,89 @@
+         self.pipe = LTX2Pipeline.from_pretrained(MODEL_REPO, torch_dtype=torch.bfloat16, cache_dir=CACHE_ROOT, token=token)
+         self.pipe.to("cuda")
+         self.pipe.vae.enable_tiling()
++        if hasattr(self.pipe.vae, "enable_slicing"):
++            self.pipe.vae.enable_slicing()
++
++        # from_pipe shares the already-loaded LTX components. Do not call .to("cuda")
++        # again here; doing so needlessly walks every shared module and makes VRAM
++        # ownership harder to reason about.
+         self.i2v_pipe = LTX2ImageToVideoPipeline.from_pipe(self.pipe)
+-        self.i2v_pipe.to("cuda")
+         self.i2v_pipe.vae.enable_tiling()
++        if hasattr(self.i2v_pipe.vae, "enable_slicing"):
++            self.i2v_pipe.vae.enable_slicing()
++
+         self.fast_transformer = self.pipe.transformer
+         self.fast_scheduler = self.pipe.scheduler
+         self.pro_transformer = None
+         self.pro_scheduler = None
+         self.scheduler_cls = FlowMatchEulerDiscreteScheduler
+         self.token = token
++        self._active_mode = "fast"
++
++        # Keep the latent upsampler on CPU until it is actually needed. Keeping it
++        # resident beside the 22B transformer wastes several GiB during stage one.
+         self.upsampler_model = LTX2LatentUpsamplerModel.from_pretrained(
+             MODEL_REPO, subfolder="latent_upsampler", torch_dtype=torch.bfloat16, cache_dir=CACHE_ROOT, token=token,
+-        ).to("cuda")
++        )
+         self.upsample_pipe = LTX2LatentUpsamplePipeline(vae=self.pipe.vae, latent_upsampler=self.upsampler_model)
++        self._cuda_cleanup()
++
++    def _cuda_cleanup(self) -> None:
++        import torch
++        gc.collect()
++        if torch.cuda.is_available():
++            torch.cuda.empty_cache()
++            try:
++                torch.cuda.ipc_collect()
++            except Exception:
++                pass
++
++    def _park_transformers(self) -> None:
++        """Move both large transformer variants off GPU before another memory-heavy stage."""
++        if self.fast_transformer is not None:
++            self.fast_transformer.to("cpu")
++        if self.pro_transformer is not None:
++            self.pro_transformer.to("cpu")
++        self._active_mode = None
++        self._cuda_cleanup()
+ 
+     def _ensure_pro(self) -> None:
+         if self.pro_transformer is not None:
+             return
+         import torch
+         from diffusers import LTX2VideoTransformer3DModel
++        # Load Pro on CPU. _activate_mode moves exactly one transformer to GPU.
++        # Previously Fast stayed on GPU while Pro was loaded on GPU as well, which
++        # could consume tens of GiB of avoidable VRAM.
+         self.pro_transformer = LTX2VideoTransformer3DModel.from_pretrained(
+             MODEL_REPO, subfolder="transformer_full", torch_dtype=torch.bfloat16, cache_dir=CACHE_ROOT, token=self.token,
+-        ).to("cuda")
++        )
+         self.pro_scheduler = self.scheduler_cls.from_config(self.fast_scheduler.config, use_dynamic_shifting=True, shift_terminal=0.1)
+ 
+     def _activate_mode(self, render_mode: str) -> None:
++        render_mode = "pro" if render_mode == "pro" else "fast"
+         if render_mode == "pro":
+             self._ensure_pro()
+-            self.pipe.transformer = self.pro_transformer
+-            self.pipe.scheduler = self.pro_scheduler
+-            self.i2v_pipe.transformer = self.pro_transformer
+-            self.i2v_pipe.scheduler = self.pro_scheduler
++            target_transformer = self.pro_transformer
++            target_scheduler = self.pro_scheduler
++            inactive_transformer = self.fast_transformer
+         else:
+-            self.pipe.transformer = self.fast_transformer
+-            self.pipe.scheduler = self.fast_scheduler
+-            self.i2v_pipe.transformer = self.fast_transformer
+-            self.i2v_pipe.scheduler = self.fast_scheduler
++            target_transformer = self.fast_transformer
++            target_scheduler = self.fast_scheduler
++            inactive_transformer = self.pro_transformer
++
++        if self._active_mode != render_mode:
++            if inactive_transformer is not None:
++                inactive_transformer.to("cpu")
++            self._cuda_cleanup()
++            if target_transformer is not None:
++                target_transformer.to("cuda")
++            self._active_mode = render_mode
++
++        self.pipe.transformer = target_transformer
++        self.pipe.scheduler = target_scheduler
++        self.i2v_pipe.transformer = target_transformer
++        self.i2v_pipe.scheduler = target_scheduler
+ 
+     def _fast_kwargs(self) -> dict[str, Any]:
+         from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+@@ -891,9 +939,19 @@
+                 return_dict=False,
+                 **stage_one,
+             )
++            # Stage one is complete. Free the active 22B transformer before the
++            # latent-upsample stage, then bring only the small upsampler to CUDA.
++            self._park_transformers()
++            self.upsampler_model.to("cuda")
++            self._cuda_cleanup()
+             upscaled_video_latent = video_latent
+             for _ in range(upscale_count):
+                 upscaled_video_latent = self.upsample_pipe(latents=upscaled_video_latent, output_type="latent", return_dict=False)[0]
++            self.upsampler_model.to("cpu")
++            self._cuda_cleanup()
++
++            # Stage two uses the distilled Fast transformer. Only that transformer
++            # is moved back to GPU; Pro remains parked on CPU.
+             self._activate_mode("fast")
+             video, audio = self.pipe(
+                 latents=upscaled_video_latent,
+@@ -924,6 +982,10 @@
+             audio_sample_rate=self.pipe.vocoder.config.output_sampling_rate,
+             output_path=raw_path,
+         )
++        # Drop large decoded tensors immediately between scenes/retries. This is
++        # especially important for 1440p/4K and high-FPS story generation.
++        del video, audio
++        self._cuda_cleanup()
+         _crop(raw_path, cropped_path, target_w, target_h, render_mode, resolution, audio_quality)
+         return cropped_path
+ 
